@@ -24,5 +24,6 @@ y3.trigger = require 'y3.util.trigger'
 require 'y3.unittest.eventtest'
 require 'y3.unittest.eventperform'
 require 'y3.unittest.ltimer'
+require 'y3.unittest.save_data'
 
 print('测试完成！')

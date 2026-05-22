@@ -163,8 +163,18 @@ end
 M.upload_timer_map = {}
 
 ---@private
+---@type table<Player, table<integer, fun(drain?: boolean)>>
+M.flush_save_table_map = y3.util.multiTable(2)
+
+---@private
 ---@param player Player
-function M.upload_save_data(player)
+---@param skip_flush? boolean
+function M.upload_save_data(player, skip_flush)
+    if not skip_flush then
+        for _, flush in pairs(M.flush_save_table_map[player]) do
+            flush(true)
+        end
+    end
     local timer = M.upload_timer_map[player]
     if timer then
         return
@@ -177,6 +187,11 @@ function M.upload_save_data(player)
 end
 
 y3.game:event_on('$Y3-即将切换关卡', function ()
+    for _, player_flushes in pairs(M.flush_save_table_map) do
+        for _, flush in pairs(player_flushes) do
+            flush(true)
+        end
+    end
     for _, timer in pairs(M.upload_timer_map) do
         timer:execute()
     end
@@ -252,6 +267,11 @@ end
 function M.load_table_with_cover_disable(player, slot)
     local save_data = player.handle:get_save_data_table_value(slot) or {}
     local create_proxy
+    local pending_created = {}
+    local pending_tables = {}
+    local pending_writes = {}
+    local deleted_keys = {}
+    local flush_timer
 
     local function unpack_path(key, path)
         local key1 = path and path[1]
@@ -268,27 +288,209 @@ function M.load_table_with_cover_disable(player, slot)
         return key1, key2, key3
     end
 
+    local function path_key(key1, key2, key3)
+        local function encode_key(key)
+            if key == nil then
+                return 'nil:'
+            end
+            return type(key) .. ':' .. tostring(key)
+        end
+        return encode_key(key1)
+            .. '\0' .. encode_key(key2)
+            .. '\0' .. encode_key(key3)
+    end
+
+    local function mark_created(key1, key2, key3)
+        pending_created[path_key(key1, key2, key3)] = true
+    end
+
+    local function is_created_in_this_stage(key1, key2, key3)
+        return pending_created[path_key(key1, key2, key3)] == true
+    end
+
+    local function mark_pending_table(key1, key2, key3)
+        pending_tables[path_key(key1, key2, key3)] = true
+    end
+
+    local function unmark_pending_table(key1, key2, key3)
+        pending_tables[path_key(key1, key2, key3)] = nil
+    end
+
+    local function is_pending_table(key1, key2, key3)
+        return pending_tables[path_key(key1, key2, key3)] == true
+    end
+
+    local function mark_deleted(key1, key2, key3)
+        deleted_keys[path_key(key1, key2, key3)] = true
+    end
+
+    local function unmark_deleted(key1, key2, key3)
+        deleted_keys[path_key(key1, key2, key3)] = nil
+    end
+
+    local function is_deleted(key1, key2, key3)
+        return deleted_keys[path_key(key1, key2, key3)] == true
+    end
+
+    local function get_parent_path(key1, key2, key3)
+        if key3 and key3 ~= '' then
+            return key1, key2, ''
+        end
+        if key2 and key2 ~= '' then
+            return key1, '', ''
+        end
+    end
+
+    local function should_delay_write(key1, key2, key3)
+        local parent_key1, parent_key2, parent_key3 = get_parent_path(key1, key2, key3)
+        return parent_key1
+           and (is_created_in_this_stage(parent_key1, parent_key2, parent_key3)
+             or is_pending_table(parent_key1, parent_key2, parent_key3))
+    end
+
+    local function is_same_or_child_path(key1, key2, key3, parent_key1, parent_key2, parent_key3)
+        if key1 ~= parent_key1 then
+            return false
+        end
+        if parent_key2 == '' then
+            return true
+        end
+        if key2 ~= parent_key2 then
+            return false
+        end
+        if parent_key3 == '' then
+            return true
+        end
+        return key3 == parent_key3
+    end
+
+    local function remove_pending_writes(key1, key2, key3)
+        local write_count = 0
+        for i = 1, #pending_writes do
+            local write = pending_writes[i]
+            if not is_same_or_child_path(write.key1, write.key2, write.key3, key1, key2, key3) then
+                write_count = write_count + 1
+                pending_writes[write_count] = write
+            elseif type(write.value) == 'table' then
+                unmark_pending_table(write.key1, write.key2, write.key3)
+            end
+        end
+        for i = write_count + 1, #pending_writes do
+            pending_writes[i] = nil
+        end
+    end
+
+    local function write_native(key1, key2, key3, value)
+        if type(value) == 'table' then
+            value = {}
+        end
+        player.handle:set_save_table_key_value(slot
+            , key1
+            , value
+            , key2
+            , key3
+            , ''
+        )
+        unmark_deleted(key1, key2, key3)
+        if type(value) == 'table' then
+            unmark_pending_table(key1, key2, key3)
+            mark_created(key1, key2, key3)
+        end
+    end
+
+    local flush_pending_writes
+
+    local function schedule_flush()
+        if flush_timer then
+            return
+        end
+        flush_timer = y3.ltimer.wait(0.03, function ()
+            flush_pending_writes()
+        end)
+    end
+
+    function flush_pending_writes(drain)
+        if flush_timer then
+            flush_timer:remove()
+            flush_timer = nil
+        end
+
+        while true do
+            pending_created = {}
+            if #pending_writes == 0 then
+                if not drain then
+                    M.upload_save_data(player, true)
+                end
+                return
+            else
+                local writes = pending_writes
+                pending_writes = {}
+
+                for _, write in ipairs(writes) do
+                    if should_delay_write(write.key1, write.key2, write.key3) then
+                        pending_writes[#pending_writes + 1] = write
+                        if type(write.value) == 'table' then
+                            mark_pending_table(write.key1, write.key2, write.key3)
+                        end
+                    else
+                        write_native(write.key1, write.key2, write.key3, write.value)
+                    end
+                end
+
+                if drain then
+                    -- Keep looping until table creations and all dependent writes are native-written.
+                elseif #pending_writes > 0 or next(pending_created) then
+                    schedule_flush()
+                    return
+                else
+                    M.upload_save_data(player, true)
+                    return
+                end
+            end
+        end
+    end
+
+    M.flush_save_table_map[player][slot] = flush_pending_writes
+
     local function set_value(key, value, path)
         local key1, key2, key3 = unpack_path(key, path)
         if value == nil then
+            remove_pending_writes(key1, key2, key3)
+            unmark_pending_table(key1, key2, key3)
+            mark_deleted(key1, key2, key3)
             player.handle:remove_save_table_key_value(slot
                 , key1
                 , key2
                 , key3
             )
-        else
-            player.handle:set_save_table_key_value(slot
-                , key1
-                , value
-                , key2
-                , key3
-                , ''
-            )
+            return
+        end
+
+        if should_delay_write(key1, key2, key3) then
+            pending_writes[#pending_writes + 1] = {
+                key1 = key1,
+                key2 = key2,
+                key3 = key3,
+                value = value,
+            }
+            if type(value) == 'table' then
+                mark_pending_table(key1, key2, key3)
+            end
+            schedule_flush()
+            return
+        end
+
+        write_native(key1, key2, key3, value)
+        if type(value) == 'table' then
+            schedule_flush()
         end
     end
 
     local function get_value(key, path)
         local key1, key2, key3 = unpack_path(key, path)
+        if is_deleted(key1, key2, key3) then
+            return nil
+        end
         return player.handle:get_save_table_key_value(slot
             , key1
             , key2
@@ -301,6 +503,7 @@ function M.load_table_with_cover_disable(player, slot)
 
     ---@type Proxy.Config
     local proxy_config = {
+        cache = false,
         anySetter = function (self, raw, key, value, config, path)
             if type(key) ~= 'string'
             and math.type(key) ~= 'integer' then
@@ -329,7 +532,14 @@ function M.load_table_with_cover_disable(player, slot)
             set_value(key, value, path)
         end,
         anyGetter = function (self, raw, key, config, path)
-            local value = get_value(key, path)
+            local key1, key2, key3 = unpack_path(key, path)
+            if is_deleted(key1, key2, key3) then
+                return nil
+            end
+            local value = raw[key]
+            if value == nil then
+                value = get_value(key, path)
+            end
             if type(value) == 'table' then
                 local new_path = path and { table.unpack(path) } or {}
                 new_path[#new_path+1] = key
