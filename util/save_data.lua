@@ -466,6 +466,10 @@ function M.load_table_with_cover_disable(player, slot)
             return
         end
 
+        -- A new assignment takes effect in Lua immediately, even when the
+        -- native write is deferred until the parent table exists.
+        unmark_deleted(key1, key2, key3)
+
         if should_delay_write(key1, key2, key3) then
             pending_writes[#pending_writes + 1] = {
                 key1 = key1,

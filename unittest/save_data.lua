@@ -327,6 +327,20 @@ local function run_tests()
         assert(amp_index and value_index)
         assert(amp_index < value_index)
     end
+
+    do
+        local player = new_player()
+        local data = save_data.load_table(player, 7)
+
+        data.a = {}
+        data.a.v = 1
+        data.a.v = nil
+        data.a.v = 2
+
+        assert(data.a.v == 2)
+        fake_ltimer.debug_fastward(1)
+        assert(data.a.v == 2)
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)
