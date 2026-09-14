@@ -25,5 +25,6 @@ require 'y3.unittest.eventtest'
 require 'y3.unittest.eventperform'
 require 'y3.unittest.ltimer'
 require 'y3.unittest.save_data'
+require 'y3.unittest.save_data_eca'
 
 print('测试完成！')
