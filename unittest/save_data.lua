@@ -341,6 +341,59 @@ local function run_tests()
         fake_ltimer.debug_fastward(1)
         assert(data.a.v == 2)
     end
+
+    do
+        local player = new_player()
+        local data = save_data.load_table(player, 8)
+
+        data.a = {}
+        data.a.b = {}
+        data.a.b.c = {}
+
+        local write_ok, write_err = pcall(function ()
+            data.a.b.c.d = 1
+        end)
+        assert(not write_ok, '写入第 4 层字段必须报错')
+        assert(tostring(write_err):find('最多只支持3层嵌套', 1, true), tostring(write_err))
+
+        fake_ltimer.debug_fastward(10)
+        assert(find_call(player.calls, 'set', 'a', '', ''))
+        assert(find_call(player.calls, 'set', 'a', 'b', ''))
+        assert(find_call(player.calls, 'set', 'a', 'b', 'c'))
+        assert(count_calls(player.calls, 'set') == 3, '第 4 层写入不得落到原生接口')
+        assert(not find_call(player.calls, 'set', 'a', 'b', 'c', 1))
+    end
+
+    do
+        local player = new_player({
+            [9] = {
+                level = 5,
+                a = {
+                    b = {
+                        c = {
+                            x = 1,
+                        },
+                    },
+                },
+            },
+        })
+        local data = save_data.load_table(player, 9)
+
+        assert(data.level == 5)
+        assert(type(data.a.b.c) == 'table')
+        assert(data.a.b.c.x == nil, '第 4 层字段不可读')
+
+        local delete_ok, delete_err = pcall(function ()
+            data.a.b.c.x = nil
+        end)
+        assert(not delete_ok, '删除第 4 层字段必须报错')
+        assert(tostring(delete_err):find('最多只支持3层嵌套', 1, true), tostring(delete_err))
+
+        fake_ltimer.debug_fastward(10)
+        assert(count_calls(player.calls, 'remove') == 0, '不得删除第 3 层的整张表')
+        assert(type(data.a.b.c) == 'table')
+        assert(player.storage[9].a.b.c.x == 1)
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

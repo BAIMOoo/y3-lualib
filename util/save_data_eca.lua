@@ -2,6 +2,7 @@
 --
 -- 这些函数统一通过 save_data.load_table 访问代理表，确保 ECA 与 Lua
 -- 侧共享缓存、删除标记以及延迟写入队列。
+-- key 最多三层（key1/key2/key3），第 4 层字段非法。
 local save_data = require 'y3.util.save_data'
 
 local M = {}

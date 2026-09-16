@@ -97,6 +97,7 @@ end
 M.player_tables = y3.util.multiTable(2)
 
 ---获取玩家的存档数据（表）。修改这个表中的字段会自动更新到存档中。
+---禁止覆盖模式下最多支持 3 层嵌套（`data.a.b.c` 是最深的一层），第 4 层字段非法：写入或删除第 4 层字段会直接报错，读取第 4 层字段恒为 `nil`（因此遍历第 3 层表得到空表）。
 ---> 编辑器已经不再支持允许覆盖模式。
 ---@param player Player
 ---@param slot integer
@@ -261,6 +262,8 @@ function M.load_table_with_cover_enable(player, slot)
 end
 
 ---@private
+---禁止覆盖模式的代理实现：原生接口只有 key1/key2/key3，因此最多 3 层嵌套。
+---第 4 层字段非法：写入或删除会报错，读取恒为 `nil`。
 ---@param player Player
 ---@param slot integer
 ---@return table
@@ -513,14 +516,16 @@ function M.load_table_with_cover_disable(player, slot)
             and math.type(key) ~= 'integer' then
                 error('表的key必须是字符串或者整数')
             end
+            -- 原生接口只有 key1/key2/key3，第 4 层字段无法表示：
+            -- 若继续放行，写入会被截断到第 3 层（覆盖父表），删除会连带删掉整个子树。
+            if path and #path >= 3 then
+                error('存档表最多只支持3层嵌套')
+            end
             value = y3.helper.as_lua(value)
             local vtype = type(value)
             if vtype == 'table' then
                 if next(value) ~= nil then
                     error('禁止覆盖模式下非空表不能作为存档的值')
-                end
-                if path and #path >= 3 then
-                    error('存档表最多只支持3层嵌套')
                 end
                 if y3.proxy.raw(value) then
                     value = y3.proxy.raw(value)
@@ -536,6 +541,10 @@ function M.load_table_with_cover_disable(player, slot)
             set_value(key, value, path)
         end,
         anyGetter = function (self, raw, key, config, path)
+            -- 第 4 层字段非法，该层不存在。
+            if path and #path >= 3 then
+                return nil
+            end
             local key1, key2, key3 = unpack_path(key, path)
             if is_deleted(key1, key2, key3) then
                 return nil
