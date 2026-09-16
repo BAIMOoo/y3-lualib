@@ -5,6 +5,40 @@ local M = {}
 ---@private
 M.table_cache = setmetatable({}, { __mode = 'k' })
 
+---@private
+---同一张原生表可能同时挂在多个路径下，代理缓存必须按「原生表 + 路径」两级区分，
+---否则第二个路径会复用第一个路径的代理，之后所有写入都会落到第一个路径上。
+---@param path table|integer|nil
+---@return string
+local function cache_path_key(path)
+    if path == nil then
+        return ''
+    end
+    if type(path) == 'number' then
+        return '#:' .. tostring(path)
+    end
+    local parts = {}
+    for i = 1, #path do
+        local key = path[i]
+        parts[i] = type(key) .. ':' .. tostring(key)
+    end
+    return table.concat(parts, '\0')
+end
+
+---@private
+---@param raw table
+---@param path table|integer|nil
+---@return table path_cache
+---@return string key
+local function proxy_cache_slot(raw, path)
+    local path_cache = M.table_cache[raw]
+    if not path_cache then
+        path_cache = {}
+        M.table_cache[raw] = path_cache
+    end
+    return path_cache, cache_path_key(path)
+end
+
 -- 获取玩家的存档数据（布尔）
 ---@param player Player
 ---@param slot integer
@@ -248,11 +282,12 @@ function M.load_table_with_cover_enable(player, slot)
     }
 
     function create_proxy(raw, level)
-        if M.table_cache[raw] then
-            return M.table_cache[raw]
+        local path_cache, key = proxy_cache_slot(raw, level)
+        local v = path_cache[key]
+        if not v then
+            v = y3.proxy.new(raw, proxy_config, level)
+            path_cache[key] = v
         end
-        local v = y3.proxy.new(raw, proxy_config, level)
-        M.table_cache[raw] = v
         return v
     end
 
@@ -564,11 +599,12 @@ function M.load_table_with_cover_disable(player, slot)
     }
 
     function create_proxy(raw, path)
-        if M.table_cache[raw] then
-            return M.table_cache[raw]
+        local path_cache, key = proxy_cache_slot(raw, path)
+        local v = path_cache[key]
+        if not v then
+            v = y3.proxy.new(raw, proxy_config, path)
+            path_cache[key] = v
         end
-        local v = y3.proxy.new(raw, proxy_config, path)
-        M.table_cache[raw] = v
         return v
     end
 

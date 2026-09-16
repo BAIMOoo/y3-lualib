@@ -136,8 +136,22 @@ local function run_tests()
             end
         end
 
+        local function deep_copy(value)
+            if type(value) ~= 'table' then
+                return value
+            end
+            local result = {}
+            for k, v in pairs(value) do
+                result[k] = deep_copy(v)
+            end
+            return result
+        end
+
+        -- 引擎返回的是存档的一份快照：原生写入不会回头改动这份快照，
+        -- 而 Lua 侧写入会直接落在快照上。测试必须保真这一点，
+        -- 否则「同一张表挂到两个 key」的身份在 fake 里会随原生写入被抹掉。
         function handle:get_save_data_table_value(slot)
-            return ensure_slot(slot)
+            return deep_copy(ensure_slot(slot))
         end
 
         function handle:set_save_table_key_value(slot, key1, value, key2, key3)
@@ -393,6 +407,25 @@ local function run_tests()
         assert(count_calls(player.calls, 'remove') == 0, '不得删除第 3 层的整张表')
         assert(type(data.a.b.c) == 'table')
         assert(player.storage[9].a.b.c.x == 1)
+    end
+
+    do
+        local player = new_player()
+        local data = save_data.load_table(player, 10)
+
+        -- 同一张表挂到两个 key：代理缓存必须按「原生表 + 路径」区分，
+        -- 否则两个 key 读到同一个代理，写入会落到先访问的那个路径上。
+        local shared = {}
+        data.left = shared
+        data.right = shared
+
+        assert(data.left ~= data.right, '同一张原生表挂两个 key 时不能共用代理')
+
+        data.right.value = 1
+        fake_ltimer.debug_fastward(10)
+
+        assert(find_call(player.calls, 'set', 'right', 'value', '', 1))
+        assert(count_calls(player.calls, 'set', 'left', 'value', '', 1) == 0)
     end
 end
 

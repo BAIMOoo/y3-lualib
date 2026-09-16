@@ -25,9 +25,9 @@ y3.reload = y3.reload or {
 require 'y3.util.eca_function'
 y3.eca = y3.eca or require 'y3.util.eca_helper'
 
--- The standalone unittest bootstrap intentionally does not load the full
--- ECA runtime. Install a tiny registration stub in that environment; game
--- runtime tests keep using the real y3.eca.def implementation.
+-- This test drives the bindings with a fake player, while the real ECA stack
+-- converts the first parameter to a Player and rejects it. Always swap in a
+-- small registration stub for the duration of the test, then restore.
 if not y3.game then
     y3.game = {
         event_on = function()
@@ -47,37 +47,52 @@ if not y3.helper then
         tonumber = function(value) return value end,
     }
 end
-if not y3.eca or not y3.eca.def or not y3.py_converter then
-    Bind = Bind or {}
-    y3.eca = {
-        def = function(name)
-            local builder = {}
-            function builder:with_param()
-                return self
-            end
-            function builder:with_return()
-                return self
-            end
-            function builder:call(func)
-                Bind[name] = func
-            end
-            return builder
-        end,
-    }
-    package.loaded['y3.util.save_data_eca'] = nil
+
+local real_eca = y3.eca
+local real_loaded_save_data_eca = package.loaded['y3.util.save_data_eca']
+local BIND_NAMES = { '读取存档字段', '写入存档字段', '判断字段是否存在', '删除存档字段' }
+local real_binds = {}
+for index = 1, #BIND_NAMES do
+    real_binds[BIND_NAMES[index]] = Bind and Bind[BIND_NAMES[index]]
 end
+
+Bind = Bind or {}
+y3.eca = {
+    -- 真实 y3.eca 会把参数转成 Lua 对象（fake player 会被直接拒绝），
+    -- 这里保留真实包装器的错误/返回语义（抛错转 log.error、失败返回 nil），
+    -- 只跳过参数与返回值的类型转换。顺序与 y3.eca.def 一致：with_* 先于 call。
+    def = function(name)
+        local builder = {
+            returns_value = false,
+        }
+        function builder:with_param()
+            return self
+        end
+        function builder:with_return()
+            self.returns_value = true
+            return self
+        end
+        function builder:call(func)
+            Bind[name] = function (...)
+                local function error_handler(...)
+                    log.error('在【' .. name .. '】中发生错误：\n', ...)
+                end
+                local results = table.pack(xpcall(func, error_handler, ...))
+                if not results[1] or not builder.returns_value then
+                    return nil
+                end
+                return results[2]
+            end
+        end
+        return builder
+    end,
+}
+package.loaded['y3.util.save_data_eca'] = nil
 
 local save_data_eca = require 'y3.util.save_data_eca'
 assert(save_data_eca, 'save_data_eca module must load')
 
 local real_ltimer = y3.ltimer
-y3.ltimer = {
-    wait = function ()
-        return {
-            remove = function () end,
-        }
-    end,
-}
 
 local function new_player()
     local storage = {}
@@ -150,48 +165,72 @@ local function new_player()
     return { handle = handle, storage = storage }
 end
 
-local player = new_player()
+local function run_tests()
+    y3.ltimer = {
+        wait = function ()
+            return {
+                remove = function () end,
+            }
+        end,
+    }
 
--- Top-level writes/read and optional keys omitted.
-Bind['写入存档字段'](player, 101, 'ready', 'state')
-assert(Bind['读取存档字段'](player, 101, 'state') == 'ready')
-assert(Bind['判断字段是否存在'](player, 101, 'state') == true)
+    local player = new_player()
 
--- Empty-table assignment creates the parent; nested writes then work.
-Bind['写入存档字段'](player, 101, {}, 'profile')
-assert(Bind['判断字段是否存在'](player, 101, 'profile') == true)
-Bind['写入存档字段'](player, 101, 10, 'profile', 'level')
-Bind['写入存档字段'](player, 101, {}, 'profile', 'flags')
-Bind['写入存档字段'](player, 101, true, 'profile', 'flags', 'active')
-assert(Bind['读取存档字段'](player, 101, 'profile', 'level') == 10)
-assert(Bind['读取存档字段'](player, 101, 'profile', 'flags', 'active') == true)
-assert(Bind['判断字段是否存在'](player, 101, 'profile', 'flags', 'active') == true)
+    -- Top-level writes/read and optional keys omitted.
+    Bind['写入存档字段'](player, 101, 'ready', 'state')
+    assert(Bind['读取存档字段'](player, 101, 'state') == 'ready')
+    assert(Bind['判断字段是否存在'](player, 101, 'state') == true)
 
--- Integer keys are valid at every supported path depth.
-Bind['写入存档字段'](player, 101, 'integer-key', 7)
-assert(Bind['读取存档字段'](player, 101, 7) == 'integer-key')
+    -- Empty-table assignment creates the parent; nested writes then work.
+    Bind['写入存档字段'](player, 101, {}, 'profile')
+    assert(Bind['判断字段是否存在'](player, 101, 'profile') == true)
+    Bind['写入存档字段'](player, 101, 10, 'profile', 'level')
+    Bind['写入存档字段'](player, 101, {}, 'profile', 'flags')
+    Bind['写入存档字段'](player, 101, true, 'profile', 'flags', 'active')
+    assert(Bind['读取存档字段'](player, 101, 'profile', 'level') == 10)
+    assert(Bind['读取存档字段'](player, 101, 'profile', 'flags', 'active') == true)
+    assert(Bind['判断字段是否存在'](player, 101, 'profile', 'flags', 'active') == true)
 
--- Assigning nil has Lua's delete semantics; explicit delete is idempotent.
-Bind['写入存档字段'](player, 101, nil, 'state')
-assert(Bind['判断字段是否存在'](player, 101, 'state') == false)
-Bind['删除存档字段'](player, 101, 'profile', 'level')
-Bind['删除存档字段'](player, 101, 'missing')
-assert(Bind['读取存档字段'](player, 101, 'profile', 'level') == nil)
+    -- Integer keys are valid at every supported path depth.
+    Bind['写入存档字段'](player, 101, 'integer-key', 7)
+    assert(Bind['读取存档字段'](player, 101, 7) == 'integer-key')
 
--- A nested write requires its parent table to exist.
-local previous_error = log.error
-local missing_parent_error
-log.error = function(...)
-    local parts = {}
-    for index = 1, select('#', ...) do
-        parts[index] = tostring(select(index, ...))
+    -- Assigning nil has Lua's delete semantics; explicit delete is idempotent.
+    Bind['写入存档字段'](player, 101, nil, 'state')
+    assert(Bind['判断字段是否存在'](player, 101, 'state') == false)
+    Bind['删除存档字段'](player, 101, 'profile', 'level')
+    Bind['删除存档字段'](player, 101, 'missing')
+    assert(Bind['读取存档字段'](player, 101, 'profile', 'level') == nil)
+
+    -- A nested write requires its parent table to exist.
+    local previous_error = log.error
+    local missing_parent_error
+    log.error = function(...)
+        local parts = {}
+        for index = 1, select('#', ...) do
+            parts[index] = tostring(select(index, ...))
+        end
+        missing_parent_error = table.concat(parts, ' ')
     end
-    missing_parent_error = table.concat(parts, ' ')
+    Bind['写入存档字段'](player, 101, 1, 'missing_parent', 'value')
+    log.error = previous_error
+    assert(missing_parent_error and missing_parent_error:find('父表不存在', 1, true))
 end
-Bind['写入存档字段'](player, 101, 1, 'missing_parent', 'value')
-log.error = previous_error
-assert(missing_parent_error and missing_parent_error:find('父表不存在', 1, true))
+
+local function restore_runtime()
+    y3.ltimer = real_ltimer
+    y3.eca = real_eca
+    for name, func in pairs(real_binds) do
+        Bind[name] = func
+    end
+    package.loaded['y3.util.save_data_eca'] = real_loaded_save_data_eca
+end
+
+local ok, err = xpcall(run_tests, debug.traceback)
+restore_runtime()
+
+if not ok then
+    error(err)
+end
 
 print('save_data_eca unittest passed')
-
-y3.ltimer = real_ltimer
