@@ -135,7 +135,26 @@ end
 ---@param key3? string|integer
 ---@return boolean
 local function has_field(player, slot, key1, key2, key3)
-    return read_field(player, slot, key1, key2, key3) ~= nil
+    -- 判断存在性只关心结构：「路径不存在」和「父字段不是表」都算不存在。
+    -- 不能复用 read_field：读取语义下父字段不是表会抛错（这是合理的），
+    -- 但 ECA 条件节点每次判定都刷一条错误日志，且拿不到 false。
+    normalize_keys(key1, key2, key3)
+    local data = save_data.load_table(player, slot, true)
+    local value = data[key1]
+    if key2 ~= nil then
+        if type(value) ~= 'table' then
+            return false
+        end
+        value = value[key2]
+        if key3 ~= nil then
+            if type(value) ~= 'table' then
+                return false
+            end
+            value = value[key3]
+        end
+    end
+    -- 与 read_field 的收敛方式保持一致，避免同一个值出现「读为 nil、判断为存在」。
+    return y3.helper.as_lua(value) ~= nil
 end
 
 local DEFINITIONS = {

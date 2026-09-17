@@ -202,6 +202,48 @@ local function run_tests()
     Bind['删除存档字段'](player, 101, 'missing')
     assert(Bind['读取存档字段'](player, 101, 'profile', 'level') == nil)
 
+    -- 父字段是标量时，判断存在性必须是 false：read_field 的抛错属于读取语义，
+    -- 不能被 has_field 继承（否则 ECA 条件每次判定都会刷 log.error 并返回 nil）。
+    local scalar_player = new_player()
+    Bind['写入存档字段'](scalar_player, 102, 100, 'coins')
+
+    local logged = {}
+    local previous_error_handler = log.error
+    log.error = function (...)
+        local parts = {}
+        for index = 1, select('#', ...) do
+            parts[index] = tostring(select(index, ...))
+        end
+        logged[#logged + 1] = table.concat(parts, ' ')
+    end
+
+    local has_scalar = Bind['判断字段是否存在'](scalar_player, 102, 'coins', 'x')
+    local has_scalar_deep = Bind['判断字段是否存在'](scalar_player, 102, 'coins', 'x', 'y')
+    local has_missing = Bind['判断字段是否存在'](scalar_player, 102, 'missing', 'x')
+    local has_present = Bind['判断字段是否存在'](scalar_player, 102, 'coins')
+    local has_log_count = #logged
+
+    -- read_field 的抛错行为保持不变：读取标量父字段下的路径仍然报错。
+    Bind['读取存档字段'](scalar_player, 102, 'coins', 'x')
+    local read_log = logged[#logged]
+
+    -- 参数错误仍然要暴露（structure 判断会先走 normalize_keys），不能一起吞成 false。
+    local bad_key_log_count = #logged
+    Bind['判断字段是否存在'](scalar_player, 102, nil)
+    local bad_key_log = logged[#logged]
+
+    log.error = previous_error_handler
+
+    assert(has_log_count == 0, '判断存在性不应写 log.error，实际：' .. tostring(logged[1]))
+    assert(has_scalar == false, '父字段是标量时应为 false，实际：' .. tostring(has_scalar))
+    assert(has_scalar_deep == false, '标量父字段上的三层路径应为 false，实际：' .. tostring(has_scalar_deep))
+    assert(has_missing == false, '父表不存在时应为 false，实际：' .. tostring(has_missing))
+    assert(has_present == true, '存在的字段应为 true，实际：' .. tostring(has_present))
+    assert(read_log and read_log:find('父字段不是表', 1, true),
+        '读取标量父字段下的路径仍应按读取语义报错，实际：' .. tostring(read_log))
+    assert(#logged == bad_key_log_count + 1 and bad_key_log:find('不能为空', 1, true),
+        'key 非法时判断存在性仍应报错，实际：' .. tostring(bad_key_log))
+
     -- A nested write requires its parent table to exist.
     local previous_error = log.error
     local missing_parent_error
