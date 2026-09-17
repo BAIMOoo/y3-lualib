@@ -427,6 +427,45 @@ local function run_tests()
         assert(find_call(player.calls, 'set', 'right', 'value', '', 1))
         assert(count_calls(player.calls, 'set', 'left', 'value', '', 1) == 0)
     end
+
+    do
+        -- 外部先请求上传，再在 0.1 秒窗口内写入需要多轮 flush 的嵌套表：
+        -- 上传前必须先把暂存写入排空，否则上传的原生快照会缺字段。
+        local player = new_player()
+        local data = save_data.load_table(player, 11)
+
+        ---@diagnostic disable-next-line: invisible
+        save_data.upload_save_data(player)
+        data.a = {}
+        data.a.b = {}
+        data.a.b.c = 1
+
+        fake_ltimer.debug_fastward(20)
+
+        local upload_index = find_call(player.calls, 'upload')
+        assert(upload_index, '上传必须发生')
+        for index, call in ipairs(player.calls) do
+            if call.op == 'set' then
+                assert(index < upload_index, '所有原生写入都必须排在上传之前')
+            end
+        end
+        assert(count_calls(player.calls, 'upload') == 1, '上传不得重复触发')
+    end
+
+    do
+        -- 禁止覆盖模式的表格写入由引擎自己落盘，
+        -- 只有允许覆盖模式才依赖 player.handle:upload_save_data()。
+        local player = new_player()
+        local data = save_data.load_table(player, 12)
+
+        data.a = {}
+        data.a.b = {}
+        data.a.b.c = 1
+        fake_ltimer.debug_fastward(20)
+
+        assert(find_call(player.calls, 'set', 'a', 'b', 'c'))
+        assert(count_calls(player.calls, 'upload') == 0, '未显式请求时不得上传')
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

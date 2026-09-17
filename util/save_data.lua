@@ -202,20 +202,29 @@ M.upload_timer_map = {}
 M.flush_save_table_map = y3.util.multiTable(2)
 
 ---@private
+---把暂存写入排空到原生存档。`drain` 模式下 `flush_pending_writes` 不会回调上传，
+---因此排空与上传之间不存在递归。
 ---@param player Player
----@param skip_flush? boolean
-function M.upload_save_data(player, skip_flush)
-    if not skip_flush then
-        for _, flush in pairs(M.flush_save_table_map[player]) do
-            flush(true)
-        end
+local function drain_pending_writes(player)
+    for _, flush in pairs(M.flush_save_table_map[player]) do
+        flush(true)
     end
+end
+
+---上传玩家的存档数据。
+---> 只有允许覆盖模式的表格存档需要显式上传；禁止覆盖模式（`load_table` 的默认模式）
+---> 的字段写入由引擎自己落盘，这里排空暂存写入只是为了调用方拿到的原生快照完整。
+---@param player Player
+function M.upload_save_data(player)
+    drain_pending_writes(player)
     local timer = M.upload_timer_map[player]
     if timer then
         return
     end
     M.upload_timer_map[player] = y3.ltimer.wait(0.1, function ()
         M.upload_timer_map[player] = nil
+        -- 排定时器之后写入的数据也必须先落盘，否则上传的原生快照会缺字段。
+        drain_pending_writes(player)
         player.handle:upload_save_data()
         log.info('自动保存存档：', player)
     end)
@@ -456,34 +465,27 @@ function M.load_table_with_cover_disable(player, slot)
         while true do
             pending_created = {}
             if #pending_writes == 0 then
-                if not drain then
-                    M.upload_save_data(player, true)
-                end
                 return
-            else
-                local writes = pending_writes
-                pending_writes = {}
+            end
 
-                for _, write in ipairs(writes) do
-                    if should_delay_write(write.key1, write.key2, write.key3) then
-                        pending_writes[#pending_writes + 1] = write
-                        if type(write.value) == 'table' then
-                            mark_pending_table(write.key1, write.key2, write.key3)
-                        end
-                    else
-                        write_native(write.key1, write.key2, write.key3, write.value)
+            local writes = pending_writes
+            pending_writes = {}
+
+            for _, write in ipairs(writes) do
+                if should_delay_write(write.key1, write.key2, write.key3) then
+                    pending_writes[#pending_writes + 1] = write
+                    if type(write.value) == 'table' then
+                        mark_pending_table(write.key1, write.key2, write.key3)
                     end
-                end
-
-                if drain then
-                    -- Keep looping until table creations and all dependent writes are native-written.
-                elseif #pending_writes > 0 or next(pending_created) then
-                    schedule_flush()
-                    return
                 else
-                    M.upload_save_data(player, true)
-                    return
+                    write_native(write.key1, write.key2, write.key3, write.value)
                 end
+            end
+
+            -- 依赖父表的暂存写入留到下一轮；`drain` 模式继续循环直到全部落盘。
+            if not drain and (#pending_writes > 0 or next(pending_created)) then
+                schedule_flush()
+                return
             end
         end
     end
