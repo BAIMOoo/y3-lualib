@@ -347,12 +347,13 @@ function M.load_table_with_cover_disable(player, slot)
             .. '\0' .. encode_key(key3)
     end
 
+    --创建标记要记下 key 三元组，删除父表时才能按路径把失效的标记清干净。
     local function mark_created(key1, key2, key3)
-        pending_created[path_key(key1, key2, key3)] = true
+        pending_created[path_key(key1, key2, key3)] = { key1, key2, key3 }
     end
 
     local function is_created_in_this_stage(key1, key2, key3)
-        return pending_created[path_key(key1, key2, key3)] == true
+        return pending_created[path_key(key1, key2, key3)] ~= nil
     end
 
     local function mark_pending_table(key1, key2, key3)
@@ -409,6 +410,15 @@ function M.load_table_with_cover_disable(player, slot)
             return true
         end
         return key3 == parent_key3
+    end
+
+    --原生 remove 删掉的是整棵子树，因此该路径及其子孙的「本轮已创建」标记都已失效。
+    local function unmark_created(key1, key2, key3)
+        for path, keys in pairs(pending_created) do
+            if is_same_or_child_path(keys[1], keys[2], keys[3], key1, key2, key3) then
+                pending_created[path] = nil
+            end
+        end
     end
 
     local function remove_pending_writes(key1, key2, key3)
@@ -497,6 +507,7 @@ function M.load_table_with_cover_disable(player, slot)
         if value == nil then
             remove_pending_writes(key1, key2, key3)
             unmark_pending_table(key1, key2, key3)
+            unmark_created(key1, key2, key3)
             mark_deleted(key1, key2, key3)
             player.handle:remove_save_table_key_value(slot
                 , key1
@@ -530,11 +541,8 @@ function M.load_table_with_cover_disable(player, slot)
         end
     end
 
-    local function get_value(key, path)
-        local key1, key2, key3 = unpack_path(key, path)
-        if is_deleted(key1, key2, key3) then
-            return nil
-        end
+    --读取原生同路径的值，不做任何删除标记判断。
+    local function read_native_value(key1, key2, key3)
         return player.handle:get_save_table_key_value(slot
             , key1
             , key2
@@ -543,6 +551,31 @@ function M.load_table_with_cover_disable(player, slot)
             , nil
             , ''
         )
+    end
+
+    local function get_value(key, path)
+        local key1, key2, key3 = unpack_path(key, path)
+        if is_deleted(key1, key2, key3) then
+            return nil
+        end
+        return read_native_value(key1, key2, key3)
+    end
+
+    --删除标记只是本会话的读侧影子，只有「原生同路径确实为空」时才成立：
+    --第三方绕过本代理（直接调 set_save_table_key_value）或混用其它代理把同路径
+    --写回原生后，删除已被覆盖，此时以原生为准并顺手清掉标记。
+    ---@return boolean deleted_now 是否仍处于删除状态
+    ---@return any native_value 原生值；deleted_now 为 true 时为 nil
+    local function resolve_deleted(key1, key2, key3)
+        if not is_deleted(key1, key2, key3) then
+            return false
+        end
+        local value = read_native_value(key1, key2, key3)
+        if value == nil then
+            return true
+        end
+        unmark_deleted(key1, key2, key3)
+        return false, value
     end
 
     ---@type Proxy.Config
@@ -584,12 +617,19 @@ function M.load_table_with_cover_disable(player, slot)
                 return nil
             end
             local key1, key2, key3 = unpack_path(key, path)
-            if is_deleted(key1, key2, key3) then
+            local deleted_now, native_value = resolve_deleted(key1, key2, key3)
+            if deleted_now then
                 return nil
             end
-            local value = raw[key]
-            if value == nil then
-                value = get_value(key, path)
+            local value
+            if native_value ~= nil then
+                --原生已有值：以原生为准，不回写 raw，避免再造一个会过期的影子。
+                value = native_value
+            else
+                value = raw[key]
+                if value == nil then
+                    value = get_value(key, path)
+                end
             end
             if type(value) == 'table' then
                 local new_path = path and { table.unpack(path) } or {}

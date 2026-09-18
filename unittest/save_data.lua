@@ -510,6 +510,65 @@ local function run_tests()
         assert(not ok2, '代理包着非空表必须报错')
         assert(tostring(err2):find('禁止覆盖模式下非空表不能作为存档的值', 1, true), tostring(err2))
     end
+
+    do
+        -- 删除标记只是本会话的读侧影子：第三方绕过本代理把同路径写回原生后，
+        -- 代理必须读到原生值，而不是继续被删除标记挡住。
+        local player = new_player({
+            [15] = {
+                a = { b = 1 },
+            },
+        })
+        local data = save_data.load_table(player, 15)
+
+        assert(data.a.b == 1)
+        data.a.b = nil
+        assert(data.a.b == nil)
+
+        player.handle:set_save_table_key_value(15, 'a', 7, 'b', '', '')
+        assert(player.storage[15].a.b == 7, '绕过代理写回原生必须生效')
+        assert(data.a.b == 7, '原生已有值时，代理必须读到原生值')
+
+        fake_ltimer.debug_fastward(10)
+        assert(data.a.b == 7, '对账后仍必须读到原生值')
+        assert(count_calls(player.calls, 'set', 'a', 'b', '') == 1,
+            '对账不得把值再写回原生（只允许那一次第三方写入）')
+    end
+
+    do
+        -- 对照组：原生确实为空时删除语义不变，不得因为对账就把旧值读回来。
+        local player = new_player({
+            [16] = {
+                k = 1,
+            },
+        })
+        local data = save_data.load_table(player, 16)
+
+        data.k = nil
+        assert(data.k == nil, '原生为空时删除必须胜出')
+        assert(player.storage[16].k == nil)
+
+        fake_ltimer.debug_fastward(10)
+        assert(data.k == nil, '多轮 flush 后删除仍然胜出')
+    end
+
+    do
+        -- 删除父表时 pending_created 必须一起清：原生 remove 删的是整棵子树，
+        -- 残留的「本轮已创建」标记只会让后续写入无谓地多等一轮 flush。
+        local player = new_player()
+        local data = save_data.load_table(player, 17)
+
+        data.p = {}
+        local captured = data.p
+        data.p = nil
+        captured.x = 1
+
+        assert(find_call(player.calls, 'set', 'p', 'x', '', 1),
+            '删除父表后，子字段写入不得被残留的 pending_created 推迟')
+
+        fake_ltimer.debug_fastward(10)
+        assert(count_calls(player.calls, 'set', 'p', 'x', '', 1) == 1)
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)
