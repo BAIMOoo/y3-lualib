@@ -466,6 +466,50 @@ local function run_tests()
         assert(find_call(player.calls, 'set', 'a', 'b', 'c'))
         assert(count_calls(player.calls, 'upload') == 0, '未显式请求时不得上传')
     end
+
+    do
+        -- 空表的代理挂到另一个 key：代理自带 [CONFIG]/[CUSTOM] 哨兵键，
+        -- `next(代理)` 恒非 nil，判空必须先解包成原生表再判。
+        local player = new_player()
+        local data = save_data.load_table(player, 13)
+
+        data.x = {}
+        local a = data.x
+        data.y = a
+        fake_ltimer.debug_fastward(10)
+
+        local y_index, y_call = find_call(player.calls, 'set', 'y', '', '')
+        assert(y_index, '空表的代理必须能赋值给另一个 key')
+        assert(y_call.value_type == 'table')
+        assert(y_call.empty_table_value == true, '原生 y 必须是空表')
+        assert(type(player.storage[13].y) == 'table')
+        assert(next(player.storage[13].y) == nil, '原生 y 不得带字段')
+
+        -- 不放宽非空表限制
+        local ok1, err1 = pcall(function () data.z = { 1 } end)
+        assert(not ok1, '非空表赋值必须报错')
+        assert(tostring(err1):find('禁止覆盖模式下非空表不能作为存档的值', 1, true), tostring(err1))
+    end
+
+    do
+        -- 代理包着非空表（引擎快照里的子表）仍然必须报错
+        local player = new_player({
+            [14] = {
+                a = {
+                    b = {
+                        c = { x = 1 },
+                    },
+                },
+            },
+        })
+        local data = save_data.load_table(player, 14)
+
+        assert(type(data.a.b) == 'table')
+
+        local ok2, err2 = pcall(function () data.m = data.a.b end)
+        assert(not ok2, '代理包着非空表必须报错')
+        assert(tostring(err2):find('禁止覆盖模式下非空表不能作为存档的值', 1, true), tostring(err2))
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

@@ -561,11 +561,12 @@ function M.load_table_with_cover_disable(player, slot)
             value = y3.helper.as_lua(value)
             local vtype = type(value)
             if vtype == 'table' then
+                -- 代理自带 [CONFIG]/[CUSTOM] 哨兵键，`next(代理)` 恒非 nil；
+                -- 必须先解包成原生表再判空，否则空表的代理会被误判成非空表。
+                -- 非代理表 `raw` 返回自身，因此普通表的校验语义不变。
+                value = y3.proxy.raw(value)
                 if next(value) ~= nil then
                     error('禁止覆盖模式下非空表不能作为存档的值')
-                end
-                if y3.proxy.raw(value) then
-                    value = y3.proxy.raw(value)
                 end
             elseif vtype ~= 'nil'
             and    vtype ~= 'string'
