@@ -3,6 +3,12 @@
 -- 这些函数统一通过 save_data.load_table 访问代理表，确保 ECA 与 Lua
 -- 侧共享缓存、删除标记以及延迟写入队列。
 -- key 最多三层（key1/key2/key3），第 4 层字段非法。
+--
+-- 路径解析不会创建父表：写入嵌套字段（key2 / key3）时，它的父级必须已经是表。
+-- 要新建父表，先写一个空表再写它的子字段（写 {} 是允许的）：
+--   写入存档字段(玩家, 槽位, {}, 'a')       -- 建出 a
+--   写入存档字段(玩家, 槽位, {}, 'a', 'b')  -- 建出 a.b，前提是 a 已存在
+-- 直接写 a.b 而 a 不存在会报错；删除 a.b 而 a 不存在是 no-op（不报错、不建表）。
 local save_data = require 'y3.util.save_data'
 
 local M = {}
@@ -31,35 +37,58 @@ local function normalize_keys(key1, key2, key3)
     return key1, key2, key3
 end
 
-local function get_target(data, key1, key2, key3, create)
+---@param key1 string|integer
+---@param key2? string|integer
+---@return string
+local function path_text(key1, key2)
+    if key2 == nil then
+        return tostring(key1)
+    end
+    return ('%s.%s'):format(tostring(key1), tostring(key2))
+end
+
+---把路径上的父级字段解析成表。父字段存在但不是表时一律报错（类型错的路径
+---属于数据损坏，不是「缺失」）；父字段缺失时按 must_exist 分流：true 报错
+---（写入必须有落点），false 返回 nil（删除按 no-op 处理）。
+---@param child any 父级字段的当前值
+---@param key1 string|integer
+---@param key2? string|integer
+---@param must_exist boolean
+---@return table? parent
+local function resolve_parent_table(child, key1, key2, must_exist)
+    if type(child) == 'table' then
+        return child
+    end
+    if child ~= nil then
+        error(('存档路径的父字段不是表：%s'):format(path_text(key1, key2)))
+    end
+    if must_exist then
+        error(('存档路径的父表不存在：%s'):format(path_text(key1, key2)))
+    end
+    return nil
+end
+
+---解析 ECA 路径的读写目标，返回目标表和最后一层 key。不创建父表：
+---key2 / key3 的父级必须是已存在的表，要建父表请先写一个空表（写 {} 是允许的）。
+---父表缺失时：must_exist 为 true 报错（写入），为 false 返回 nil（删除 no-op）。
+---@param data table 该槽位的顶层代理表
+---@param key1 string|integer
+---@param key2? string|integer
+---@param key3? string|integer
+---@param must_exist boolean 父表缺失时是否报错
+---@return table? target 目标表；父表缺失且 must_exist 为 false 时是 nil
+---@return string|integer? key 目标字段名
+local function get_target(data, key1, key2, key3, must_exist)
     local target = data
     if key2 ~= nil then
-        local child = target[key1]
-        if type(child) ~= 'table' then
-            if create then
-                if child ~= nil then
-                    error(('存档路径的父字段不是表：%s'):format(tostring(key1)))
-                end
-                error(('存档路径的父表不存在：%s'):format(tostring(key1)))
-            end
-            if child ~= nil then
-                error(('存档路径的父字段不是表：%s'):format(tostring(key1)))
-            end
+        local child = resolve_parent_table(target[key1], key1, nil, must_exist)
+        if not child then
             return nil
         end
         target = child
         if key3 ~= nil then
-            child = target[key2]
-            if type(child) ~= 'table' then
-                if create then
-                    if child ~= nil then
-                        error(('存档路径的父字段不是表：%s.%s'):format(tostring(key1), tostring(key2)))
-                    end
-                    error(('存档路径的父表不存在：%s.%s'):format(tostring(key1), tostring(key2)))
-                end
-                if child ~= nil then
-                    error(('存档路径的父字段不是表：%s.%s'):format(tostring(key1), tostring(key2)))
-                end
+            child = resolve_parent_table(target[key2], key1, key2, must_exist)
+            if not child then
                 return nil
             end
             target = child

@@ -244,19 +244,72 @@ local function run_tests()
     assert(#logged == bad_key_log_count + 1 and bad_key_log:find('不能为空', 1, true),
         'key 非法时判断存在性仍应报错，实际：' .. tostring(bad_key_log))
 
-    -- A nested write requires its parent table to exist.
-    local previous_error = log.error
-    local missing_parent_error
-    log.error = function(...)
-        local parts = {}
-        for index = 1, select('#', ...) do
-            parts[index] = tostring(select(index, ...))
+    -- 路径解析不创建父表：要建父表必须先写一个空表（写 {} 是允许的）。
+    -- 写入时父表缺失必须报错；删除时父表缺失是 no-op（不报错、不建表）。
+    local captured_errors
+    local function capture_errors()
+        captured_errors = {}
+        local previous = log.error
+        log.error = function(...)
+            local parts = {}
+            for index = 1, select('#', ...) do
+                parts[index] = tostring(select(index, ...))
+            end
+            captured_errors[#captured_errors + 1] = table.concat(parts, ' ')
         end
-        missing_parent_error = table.concat(parts, ' ')
+        return previous
     end
+
+    local function drain_pending_writes(target_player, slot)
+        local save_data = require 'y3.util.save_data'
+        local flush = save_data.flush_save_table_map[target_player][slot]
+        if flush then
+            flush(true)
+        end
+    end
+
+    -- key2 层父表缺失：写入报错，且不会凭空建出父表。
+    local previous_write_error = capture_errors()
     Bind['写入存档字段'](player, 101, 1, 'missing_parent', 'value')
-    log.error = previous_error
-    assert(missing_parent_error and missing_parent_error:find('父表不存在', 1, true))
+    local write_errors = captured_errors
+    log.error = previous_write_error
+    drain_pending_writes(player, 101)
+    assert(#write_errors == 1 and write_errors[1]:find('父表不存在', 1, true),
+        '写入时父表缺失必须报错，实际：' .. tostring(write_errors[1]))
+    assert(player.storage[101].missing_parent == nil, '写入报错后不应创建父表')
+
+    -- key3 层祖父表缺失：写入同样报错，路径上不留表。
+    local previous_deep_write_error = capture_errors()
+    Bind['写入存档字段'](player, 101, 1, 'missing_grand', 'mid', 'leaf')
+    local deep_write_errors = captured_errors
+    log.error = previous_deep_write_error
+    drain_pending_writes(player, 101)
+    assert(#deep_write_errors == 1 and deep_write_errors[1]:find('父表不存在', 1, true),
+        '祖父表缺失时三层写入必须报错，实际：' .. tostring(deep_write_errors[1]))
+    assert(player.storage[101].missing_grand == nil, '写入报错后不应创建祖父表')
+
+    -- 删除在父表缺失时是 no-op：不报错、不建表。
+    local previous_delete_error = capture_errors()
+    Bind['删除存档字段'](player, 101, 'absent_parent', 'value')
+    Bind['删除存档字段'](player, 101, 'absent_grand', 'mid', 'leaf')
+    local delete_errors = captured_errors
+    log.error = previous_delete_error
+    drain_pending_writes(player, 101)
+    assert(#delete_errors == 0, '父表缺失时删除不应报错，实际：' .. tostring(delete_errors[1]))
+    assert(Bind['判断字段是否存在'](player, 101, 'absent_parent') == false)
+    assert(Bind['判断字段是否存在'](player, 101, 'absent_grand') == false)
+    assert(player.storage[101].absent_parent == nil, '删除不应创建父表')
+    assert(player.storage[101].absent_grand == nil, '删除不应创建祖父表')
+
+    -- 「父表缺失」是 no-op，「父字段不是表」仍然报错，两者不能混为一谈。
+    local scalar_delete_player = new_player()
+    Bind['写入存档字段'](scalar_delete_player, 103, 100, 'coins')
+    local previous_scalar_delete_error = capture_errors()
+    Bind['删除存档字段'](scalar_delete_player, 103, 'coins', 'x')
+    local scalar_delete_errors = captured_errors
+    log.error = previous_scalar_delete_error
+    assert(#scalar_delete_errors == 1 and scalar_delete_errors[1]:find('父字段不是表', 1, true),
+        '父字段是标量时删除仍应报错，实际：' .. tostring(scalar_delete_errors[1]))
 end
 
 local function restore_runtime()
