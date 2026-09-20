@@ -74,7 +74,7 @@ local function run_tests()
     package.loaded['y3.util.save_data'] = nil
     local save_data = require 'y3.util.save_data'
 
-    local function new_player(initial_tables)
+    local function new_player(initial_tables, native_set_hook)
         local calls = {}
         local storage = initial_tables or {}
         local handle = {}
@@ -154,7 +154,10 @@ local function run_tests()
             return deep_copy(ensure_slot(slot))
         end
 
-        function handle:set_save_table_key_value(slot, key1, value, key2, key3)
+        function handle:set_save_table_key_value(slot, key1, value, key2, key3, value_convert_func)
+            if native_set_hook then
+                native_set_hook(slot, key1, value, key2, key3)
+            end
             if type(value) == 'table' and next(value) ~= nil then
                 error('native table creation must receive an empty table')
             end
@@ -629,6 +632,48 @@ local function run_tests()
         assert(player.storage[22].settings.diff == 2, '最终原生值必须等于最后一次赋值')
         assert(count_calls(player.calls, 'set', 'settings', 'diff', 'mode') == 0,
             '被取代的子字段写入不得下发到原生')
+    end
+
+    do
+        -- 单条原生写入失败不能吃掉同批次的其它写入，也不能静默：失败会记日志并重排重试。
+        local failing = true
+        local player = new_player(nil, function (_, _, _, key2)
+            if failing and key2 == 'bad' then
+                error('模拟原生写入失败')
+            end
+        end)
+        local data = save_data.load_table(player, 23)
+
+        local errors = {}
+        local previous_error = log.error
+        log.error = function (...)
+            local parts = {}
+            for index = 1, select('#', ...) do
+                parts[index] = tostring(select(index, ...))
+            end
+            errors[#errors + 1] = table.concat(parts, ' ')
+        end
+
+        data.root = {}
+        data.root.bad = 1
+        data.root.good = 2
+        fake_ltimer.debug_fastward(10)
+
+        log.error = previous_error
+
+        assert(#errors >= 2, '写入失败必须先重试再放弃，且必须记日志，实际：' .. tostring(#errors))
+        assert(errors[1]:find('模拟原生写入失败', 1, true), errors[1])
+        assert(player.storage[23].root.good == 2, '同批次的其它写入不得被一次失败带走')
+        assert(player.storage[23].root.bad == nil, '失败的字段确实没落到原生')
+        assert(data.root.bad == 1, '失败的字段仍必须能读回 Lua 侧的值')
+
+        -- 失败注入解除后重试必须成功。
+        failing = false
+        data.root.bad = 3
+        fake_ltimer.debug_fastward(10)
+
+        assert(player.storage[23].root.bad == 3)
+        assert(data.root.bad == 3)
     end
 end
 

@@ -311,6 +311,11 @@ function M.load_table_with_cover_enable(player, slot)
 end
 
 ---@private
+--单条字段写入失败后的最多尝试次数：失败先重排到下一轮，超过次数就放弃并记录日志。
+--坏写入既不能吃掉同批次的其它写入，也不能让 flush 定时器无限空转。
+local MAX_WRITE_ATTEMPTS = 3
+
+---@private
 ---禁止覆盖模式的代理实现：原生接口只有 key1/key2/key3，因此最多 3 层嵌套。
 ---第 4 层字段非法：写入或删除会报错，读取恒为 `nil`。
 ---@param player Player
@@ -460,6 +465,16 @@ function M.load_table_with_cover_disable(player, slot)
         end
     end
 
+    ---@param write { key1: any, key2: any, key3: any }
+    ---@return string
+    local function write_log_text(write)
+        return ('slot=%s key1=%s key2=%s key3=%s'):format(tostring(slot)
+            , tostring(write.key1)
+            , tostring(write.key2)
+            , tostring(write.key3)
+        )
+    end
+
     local flush_pending_writes
 
     local function schedule_flush()
@@ -493,7 +508,19 @@ function M.load_table_with_cover_disable(player, slot)
                         mark_pending_table(write.key1, write.key2, write.key3)
                     end
                 else
-                    write_native(write.key1, write.key2, write.key3, write.value)
+                    --单条写入失败不能让同批次的其它写入一起丢：每条单独 pcall，失败的
+                    --重排到下一轮，超过次数才放弃。同一路径同时最多只有一个暂存写入
+                    --（新赋值会撤销旧的），所以重排不会让旧值盖掉新值。
+                    local ok, err = pcall(write_native, write.key1, write.key2, write.key3, write.value)
+                    if not ok then
+                        write.attempts = (write.attempts or 0) + 1
+                        if write.attempts < MAX_WRITE_ATTEMPTS then
+                            log.error('存档字段写入失败，稍后重试：', err, write_log_text(write))
+                            pending_writes[#pending_writes + 1] = write
+                        else
+                            log.error('存档字段写入连续失败，已放弃：', err, write_log_text(write))
+                        end
+                    end
                 end
             end
 
