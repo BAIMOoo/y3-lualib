@@ -328,6 +328,7 @@ function M.load_table_with_cover_disable(player, slot)
     local pending_tables = {}
     local pending_writes = {}
     local deleted_keys = {}
+    local unflushed_keys = {}
     local flush_timer
 
     local function unpack_path(key, path)
@@ -390,6 +391,20 @@ function M.load_table_with_cover_disable(player, slot)
         return deleted_keys[path_key(key1, key2, key3)] == true
     end
 
+    --字段的最新值还只存在于 Lua 侧（`raw`）：写入被推迟或写入失败时原生读到的还是旧值，
+    --这期间的读取必须以 Lua 侧为准。落盘成功后清掉，读取重新以原生为准。
+    local function mark_unflushed(key1, key2, key3)
+        unflushed_keys[path_key(key1, key2, key3)] = true
+    end
+
+    local function unmark_unflushed(key1, key2, key3)
+        unflushed_keys[path_key(key1, key2, key3)] = nil
+    end
+
+    local function has_unflushed_write(key1, key2, key3)
+        return unflushed_keys[path_key(key1, key2, key3)] == true
+    end
+
     --原生写入会沿路径落进父表（缺失的中间表由引擎按 key1/key2/key3 补建），所以路径上
     --任何一层祖先表「本轮刚建」或「还在等待落盘」时这次写入都得等下一轮：只看直接父表
     --会漏掉「祖父表刚建、中间表尚不存在」的三层写入。
@@ -437,8 +452,12 @@ function M.load_table_with_cover_disable(player, slot)
             if not is_same_or_child_path(write.key1, write.key2, write.key3, key1, key2, key3) then
                 write_count = write_count + 1
                 pending_writes[write_count] = write
-            elseif type(write.value) == 'table' then
-                unmark_pending_table(write.key1, write.key2, write.key3)
+            else
+                --被撤销的暂存写入不再代表 Lua 侧的最新值。
+                unmark_unflushed(write.key1, write.key2, write.key3)
+                if type(write.value) == 'table' then
+                    unmark_pending_table(write.key1, write.key2, write.key3)
+                end
             end
         end
         for i = write_count + 1, #pending_writes do
@@ -457,6 +476,8 @@ function M.load_table_with_cover_disable(player, slot)
             , key3
             , ''
         )
+        --已经落到原生，Lua 侧不再是这个字段的唯一持有者。
+        unmark_unflushed(key1, key2, key3)
         unmark_deleted(key1, key2, key3)
         if type(value) == 'table' then
             unmark_pending_table(key1, key2, key3)
@@ -554,6 +575,7 @@ function M.load_table_with_cover_disable(player, slot)
         -- 父表，所以必须一并撤销（删除分支同样会撤销这些暂存写入）。
         remove_pending_writes(key1, key2, key3)
         unmark_deleted(key1, key2, key3)
+        mark_unflushed(key1, key2, key3)
 
         if should_delay_write(key1, key2, key3) then
             pending_writes[#pending_writes + 1] = {
@@ -585,14 +607,6 @@ function M.load_table_with_cover_disable(player, slot)
             , nil
             , ''
         )
-    end
-
-    local function get_value(key, path)
-        local key1, key2, key3 = unpack_path(key, path)
-        if is_deleted(key1, key2, key3) then
-            return nil
-        end
-        return read_native_value(key1, key2, key3)
     end
 
     --删除标记只是本会话的读侧影子，只有「原生同路径确实为空」时才成立：
@@ -657,12 +671,24 @@ function M.load_table_with_cover_disable(player, slot)
             end
             local value
             if native_value ~= nil then
-                --原生已有值：以原生为准，不回写 raw，避免再造一个会过期的影子。
+                --删除被原生值覆盖：以原生为准，不回写 raw，避免再造一个会过期的影子。
                 value = native_value
-            else
+            elseif has_unflushed_write(key1, key2, key3) then
+                --本代理的赋值还没落盘：原生现在读到的还是旧值，必须用 Lua 侧的值。
                 value = raw[key]
-                if value == nil then
-                    value = get_value(key, path)
+            else
+                --其余情况以原生为准：第三方绕过本代理改过原生时不会读到过期快照
+                --（与删除标记的对账同理）。两个例外：
+                --  * 快照里是表：保留快照里的表，代理身份才稳定、写入才落在同一张表上；
+                --  * 原生为空：退回快照值，避免受引擎取值差异影响。
+                local cached = raw[key]
+                if type(cached) == 'table' then
+                    value = cached
+                else
+                    value = read_native_value(key1, key2, key3)
+                    if value == nil then
+                        value = cached
+                    end
                 end
             end
             if type(value) == 'table' then

@@ -695,6 +695,40 @@ local function run_tests()
         assert(find_call(player.calls, 'set', 'a', 'b', 'c', 1))
         assert(player.storage[24].a.b.c == 1)
     end
+
+    do
+        -- 第三方（或引擎）绕过本代理改写原生后，本代理没写过这个字段时必须读到原生值，
+        -- 不能读回过期快照——和删除标记的对账是同一条规则。
+        local player = new_player({
+            [25] = {
+                k = 1,
+                root = { v = 1 },
+            },
+        })
+        local data = save_data.load_table(player, 25)
+
+        assert(data.k == 1)
+        player.handle:set_save_table_key_value(25, 'k', 99, '', '', '')
+        assert(data.k == 99, '没写过这个字段时必须以原生为准')
+
+        -- 但本代理自己的赋值还没落盘时，原生还是旧值，必须用 Lua 侧的值。
+        data.root = {}
+        data.root.v = 5
+        assert(data.root.v == 5, '暂存写入未落盘时必须用 Lua 侧的值')
+
+        -- 表值仍然用快照里的表：代理身份稳定，写入才会落在同一张表上。
+        local first = data.root
+        player.handle:set_save_table_key_value(25, 'root', {}, '', '', '')
+        assert(data.root == first, '原生换成另一张表时仍必须返回原代理')
+        assert(data.root.v == 5)
+
+        -- 引擎取值滞后（原生读不到刚写过的值）时必须退回快照值，不能读成 nil。
+        player.handle.get_save_table_key_value = function ()
+            return nil
+        end
+        assert(data.k == 1, '原生读不到时应退回快照值')
+        assert(data.root.v == 5, '暂存写入本来就不依赖原生取值')
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)
