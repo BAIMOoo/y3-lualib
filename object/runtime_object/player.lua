@@ -297,6 +297,10 @@ function M:share_vision_of_unit(unit, share)
 end
 
 ---上传存档
+-- 注意：禁止覆盖模式的表格存档（`y3.save_data.load_table` 的默认模式）不需要调用本接口。
+-- 它的字段写入会实时写进引擎内存存档（需要多轮写入的嵌套字段也会在约 0.03s 后自行写入、
+-- 切关卡前被统一排空）；引擎负责把内存存档写进数据库，默认只发生在游戏结束时。
+-- 详见 util/save_data.lua。
 function M:upload_save_data()
     self.handle:upload_save_data()
 end
