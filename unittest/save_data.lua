@@ -729,6 +729,63 @@ local function run_tests()
         assert(data.k == 1, '原生读不到时应退回快照值')
         assert(data.root.v == 5, '暂存写入本来就不依赖原生取值')
     end
+
+    do
+        -- 表值/标量写入连续失败被放弃后，该路径的「等待落盘的表」与「未落盘」标记
+        -- 必须一并清掉：
+        --  * 残留的 pending_table 会让子字段写入被永久推迟（下面 find_call 立刻失败）；
+        --  * 残留的 unflushed 会让读取永久遮蔽原生后来写入的值；
+        --  * 两者都不清时，drain 模式（切关卡 / upload_save_data）会死循环。
+        local failing = true
+        local player = new_player(nil, function (_, _, _, key2, key3)
+            if failing and key3 == '' and (key2 == 'tbl' or key2 == 'val') then
+                error('模拟原生写入失败')
+            end
+        end)
+        local data = save_data.load_table(player, 26)
+
+        local errors = {}
+        local previous_error = log.error
+        log.error = function (...)
+            local parts = {}
+            for index = 1, select('#', ...) do
+                parts[index] = tostring(select(index, ...))
+            end
+            errors[#errors + 1] = table.concat(parts, ' ')
+        end
+
+        data.root = {}
+        data.root.tbl = {}
+        data.root.val = 1
+        fake_ltimer.debug_fastward(10)
+        log.error = previous_error
+
+        assert(#errors >= 2, '放弃写入必须记日志，实际：' .. tostring(#errors))
+        assert(errors[#errors]:find('已放弃', 1, true), errors[#errors])
+        assert(player.storage[26].root.tbl == nil, '失败的建表写入确实没落到原生')
+        assert(player.storage[26].root.val == nil)
+        assert(type(data.root.tbl) == 'table', '失败的字段仍必须能读回 Lua 侧的值')
+        assert(data.root.val == 1)
+
+        -- 关键：放弃建表后，子字段写入不得再被残留的 pending_table 推迟，
+        -- 这一步必须立刻下发原生写入。
+        data.root.tbl.child = 1
+        assert(find_call(player.calls, 'set', 'root', 'tbl', 'child', 1),
+            '放弃建表后，子字段写入不得被残留的 pending_table 推迟')
+        fake_ltimer.debug_fastward(10)
+        assert(player.storage[26].root.tbl.child == 1, '子字段必须落到原生')
+
+        -- drain 路径（切关卡 / 上传）必须能返回。若上面的标记清理被回退，
+        -- find_call 那条断言会先失败，不会走到这里挂住。
+        assert(level_switch_callback)
+        level_switch_callback()
+
+        -- 放弃写入不再被残留的「未落盘」标记永久遮蔽：第三方写回原生必须可见。
+        failing = false
+        player.handle:set_save_table_key_value(26, 'root', 7, 'val', '', '')
+        assert(player.storage[26].root.val == 7)
+        assert(data.root.val == 7, '放弃写入后，原生的新值必须能被读到')
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

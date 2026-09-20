@@ -2,6 +2,14 @@
 ---@class SaveData
 local M = {}
 
+--写入模型（先看这里：改动前先确认不要给这套存档再加显式上传/保存）：
+-- * 本文件注释里的「落到原生 / 写进内存 / 落盘」都指写进引擎内存中的存档表，不是写数据库；
+--   引擎负责把内存存档写进数据库，默认只发生在游戏结束时，与这里的写入是否及时无关。
+-- * 禁止覆盖模式（`load_table` 的默认模式）的表存档，字段写入是实时的：每次赋值都会立刻
+--   写进引擎内存存档，不需要任何显式上传/保存接口，`Player:upload_save_data` 不是保存它的途径。
+-- * 只有「先建父表、再写子字段」这类嵌套字段会被暂存，约 0.03s 后的 flush 轮次自动写进内存；
+--   `$Y3-即将切换关卡` 前会统一排空。
+-- * 暂存/重试中的字段在 Lua 侧立即可读（读取以 Lua 侧为准），写进内存后以原生值为准。
 ---@private
 M.table_cache = setmetatable({}, { __mode = 'k' })
 
@@ -133,6 +141,10 @@ M.player_tables = y3.util.multiTable(2)
 ---获取玩家的存档数据（表）。修改这个表中的字段会自动更新到存档中。
 ---禁止覆盖模式下最多支持 3 层嵌套（`data.a.b.c` 是最深的一层），第 4 层字段非法：写入或删除第 4 层字段会直接报错，读取第 4 层字段恒为 `nil`（因此遍历第 3 层表得到空表）。
 ---> 编辑器已经不再支持允许覆盖模式。
+---> 表内字段的写入是实时的：每次赋值都会立刻写进引擎内存中的存档表，不需要（也不应该）再调用
+---> `y3.save_data.upload_save_data` 或 `Player:upload_save_data` 来保存（引擎负责把内存存档写进
+---> 数据库，默认只发生在游戏结束时）。唯一会被延后的是「父表还没写进内存」的嵌套写入：
+---> 它会在约 0.03s 后的 flush 轮次自行写入，切关卡前也会被统一排空。
 ---@param player Player
 ---@param slot integer
 ---@param disable_cover? boolean # 是否禁用覆盖，必须和存档设置中的一致（默认为 `true`；`nil` 与 `true` 等价）
@@ -218,7 +230,10 @@ end
 
 ---上传玩家的存档数据。
 ---> 只有允许覆盖模式的表格存档需要显式上传；禁止覆盖模式（`load_table` 的默认模式）
----> 的字段写入由引擎自己落盘，这里排空暂存写入只是为了调用方拿到的原生快照完整。
+---> 的字段写入会实时写进引擎内存存档，不需要通过本接口保存：这里排空暂存写入只是为了让
+---> 显式上传时调用方拿到的原生快照完整（禁止覆盖模式下的暂存写入会由 flush 轮次 / 切关卡
+---> 自行写进内存）。引擎负责把内存存档写进数据库，默认只发生在游戏结束时。
+---> 详见 `load_table` 的注释。
 ---@param player Player
 function M.upload_save_data(player)
     drain_pending_writes(player)
@@ -538,6 +553,13 @@ function M.load_table_with_cover_disable(player, slot)
                             log.error('存档字段写入失败，稍后重试：', err, write_log_text(write))
                             pending_writes[#pending_writes + 1] = write
                         else
+                            --放弃写入时该路径的标记必须一并清掉：
+                            -- * 残留的「等待写进内存的表」会让子字段写入被 should_delay_write
+                            --   永久推迟，`drain` 模式（切关卡 / upload_save_data）会在
+                            --   flush_pending_writes 的 while true 里死循环；
+                            -- * 残留的「还没写进内存」会让读取永久遮蔽原生后来的新值。
+                            unmark_pending_table(write.key1, write.key2, write.key3)
+                            unmark_unflushed(write.key1, write.key2, write.key3)
                             log.error('存档字段写入连续失败，已放弃：', err, write_log_text(write))
                         end
                     end
