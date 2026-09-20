@@ -390,20 +390,19 @@ function M.load_table_with_cover_disable(player, slot)
         return deleted_keys[path_key(key1, key2, key3)] == true
     end
 
-    local function get_parent_path(key1, key2, key3)
-        if key3 and key3 ~= '' then
-            return key1, key2, ''
-        end
-        if key2 and key2 ~= '' then
-            return key1, '', ''
-        end
-    end
-
+    --原生写入会沿路径落进父表（缺失的中间表由引擎按 key1/key2/key3 补建），所以路径上
+    --任何一层祖先表「本轮刚建」或「还在等待落盘」时这次写入都得等下一轮：只看直接父表
+    --会漏掉「祖父表刚建、中间表尚不存在」的三层写入。
     local function should_delay_write(key1, key2, key3)
-        local parent_key1, parent_key2, parent_key3 = get_parent_path(key1, key2, key3)
-        return parent_key1
-           and (is_created_in_this_stage(parent_key1, parent_key2, parent_key3)
-             or is_pending_table(parent_key1, parent_key2, parent_key3))
+        if not (key2 and key2 ~= '') then
+            return false
+        end
+        if key3 and key3 ~= '' then
+            if is_created_in_this_stage(key1, key2, '') or is_pending_table(key1, key2, '') then
+                return true
+            end
+        end
+        return is_created_in_this_stage(key1, '', '') or is_pending_table(key1, '', '')
     end
 
     local function is_same_or_child_path(key1, key2, key3, parent_key1, parent_key2, parent_key3)

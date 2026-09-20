@@ -675,6 +675,26 @@ local function run_tests()
         assert(player.storage[23].root.bad == 3)
         assert(data.root.bad == 3)
     end
+
+    do
+        -- 三层写入只要路径上还有本轮刚建的祖先表，就必须等一轮：只看直接父表会漏掉
+        -- 「祖父表刚建、中间表不在代理的暂存记录里」的情况（例如地图脚本直接改了自己
+        -- 传进存档的那张表，代理并不知道中间表存在）。
+        local player = new_player()
+        local data = save_data.load_table(player, 24)
+
+        local assigned = {}
+        data.a = assigned
+        assigned.b = {}
+        data.a.b.c = 1
+
+        assert(not find_call(player.calls, 'set', 'a', 'b', 'c'),
+            '祖父表本轮刚建时，三层写入不得与它同批下发')
+
+        fake_ltimer.debug_fastward(10)
+        assert(find_call(player.calls, 'set', 'a', 'b', 'c', 1))
+        assert(player.storage[24].a.b.c == 1)
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)
