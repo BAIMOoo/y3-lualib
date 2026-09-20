@@ -522,8 +522,11 @@ function M.load_table_with_cover_disable(player, slot)
             return
         end
 
-        -- A new assignment takes effect in Lua immediately, even when the
-        -- native write is deferred until the parent table exists.
+        -- 新的赋值在 Lua 侧立即生效，即使原生写入因为父表还没建好而推迟。
+        -- 同路径（及其子孙路径）里还挂着的暂存写入已被这次赋值取代：它们会在后续
+        -- 轮次落盘，那时顺序已经不等于赋值顺序，甚至可能写进一个已经变成标量的
+        -- 父表，所以必须一并撤销（删除分支同样会撤销这些暂存写入）。
+        remove_pending_writes(key1, key2, key3)
         unmark_deleted(key1, key2, key3)
 
         if should_delay_write(key1, key2, key3) then

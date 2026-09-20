@@ -591,6 +591,45 @@ local function run_tests()
         assert(not ok, '禁止覆盖与允许覆盖混用必须报错')
         assert(tostring(err):find('覆盖类型设置与上次不一致', 1, true), tostring(err))
     end
+
+    do
+        -- 先建父表、再写子字段，随后把父字段改回标量：被推迟的子字段写入已被这次
+        -- 赋值取代，不得在后续轮次落盘（否则原生先收到 settings.diff = 2，
+        -- 又收到 settings.diff.mode = 1，写进一个已经是标量的父表）。
+        local player = new_player()
+        local data = save_data.load_table(player, 21)
+
+        data.settings = {}
+        data.settings.diff = {}
+        data.settings.diff.mode = 1
+        data.settings.diff = 2
+
+        fake_ltimer.debug_fastward(10)
+
+        assert(player.storage[21].settings.diff == 2, '最终原生值必须等于最后一次赋值')
+        assert(count_calls(player.calls, 'set', 'settings', 'diff', 'mode') == 0,
+            '被取代的子字段写入不得下发到原生')
+        assert(data.settings.diff == 2)
+    end
+
+    do
+        -- 同上，只是赋值落在两轮 flush 之间。
+        local player = new_player()
+        local data = save_data.load_table(player, 22)
+
+        data.settings = {}
+        data.settings.diff = {}
+        data.settings.diff.mode = 1
+        fake_ltimer.debug_fastward(1)
+        assert(player.storage[22].settings.diff ~= nil, '第一轮 flush 后 diff 表应已落盘')
+
+        data.settings.diff = 2
+        fake_ltimer.debug_fastward(10)
+
+        assert(player.storage[22].settings.diff == 2, '最终原生值必须等于最后一次赋值')
+        assert(count_calls(player.calls, 'set', 'settings', 'diff', 'mode') == 0,
+            '被取代的子字段写入不得下发到原生')
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)
