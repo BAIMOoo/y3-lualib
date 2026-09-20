@@ -569,6 +569,28 @@ local function run_tests()
         fake_ltimer.debug_fastward(10)
         assert(count_calls(player.calls, 'set', 'p', 'x', '', 1) == 1)
     end
+
+    do
+        -- ECA 接口固定传 true，Lua 接口按文档默认传 nil，两者都表示禁止覆盖模式：
+        -- 同一个槽位混用必须拿到同一个代理，而不是报「覆盖类型设置与上次不一致」。
+        local player = new_player()
+
+        local data_by_default = save_data.load_table(player, 18)
+        assert(save_data.load_table(player, 18, true) == data_by_default,
+            'nil 与 true 必须等价')
+
+        local data_by_flag = save_data.load_table(player, 19, true)
+        assert(save_data.load_table(player, 19) == data_by_flag,
+            'true 与 nil 必须等价')
+
+        -- 允许覆盖模式已经被编辑器废弃，但它确实和禁止覆盖模式不同，仍然必须报错。
+        assert(save_data.load_table(player, 20, false))
+        local ok, err = pcall(function ()
+            return save_data.load_table(player, 20, true)
+        end)
+        assert(not ok, '禁止覆盖与允许覆盖混用必须报错')
+        assert(tostring(err):find('覆盖类型设置与上次不一致', 1, true), tostring(err))
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

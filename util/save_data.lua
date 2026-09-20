@@ -135,24 +135,29 @@ M.player_tables = y3.util.multiTable(2)
 ---> 编辑器已经不再支持允许覆盖模式。
 ---@param player Player
 ---@param slot integer
----@param disable_cover? boolean # 是否禁用覆盖，必须和存档设置中的一致（默认为 `true`)
+---@param disable_cover? boolean # 是否禁用覆盖，必须和存档设置中的一致（默认为 `true`；`nil` 与 `true` 等价）
 ---@return table
 function M.load_table(player, slot, disable_cover)
+    -- `nil` 与 `true` 都表示禁止覆盖模式，先归一化再比较：否则 ECA 层（固定传 `true`）
+    -- 与 Lua 层（默认传 `nil`）访问同一个槽位时会误报「覆盖类型设置与上次不一致」。
+    local disable = disable_cover == true or disable_cover == nil
     local last_table = M.player_tables[player][slot]
     if last_table then
-        if last_table[2] == disable_cover then
+        if last_table[2] == disable then
             return last_table[1]
         end
         error('存档的覆盖类型设置与上次不一致！')
     end
     last_table = {}
-    M.player_tables[player][slot] = last_table
-    if disable_cover == true or disable_cover == nil then
+    if disable then
         last_table[1] = M.load_table_with_cover_disable(player, slot)
     else
         last_table[1] = M.load_table_with_cover_enable(player, slot)
     end
-    last_table[2] = disable_cover
+    last_table[2] = disable
+    -- 加载成功后才登记缓存：加载失败时留下的半成品会让后续调用拿到
+    -- 「覆盖类型设置与上次不一致」这种与真实原因无关的错误。
+    M.player_tables[player][slot] = last_table
     return last_table[1]
 end
 

@@ -310,6 +310,20 @@ local function run_tests()
     log.error = previous_scalar_delete_error
     assert(#scalar_delete_errors == 1 and scalar_delete_errors[1]:find('父字段不是表', 1, true),
         '父字段是标量时删除仍应报错，实际：' .. tostring(scalar_delete_errors[1]))
+
+    -- ECA 接口固定传 true，Lua 接口按文档默认传 nil，两者都是禁止覆盖模式：
+    -- 同一个槽位混用必须共用同一个代理，而不是报「覆盖类型设置与上次不一致」。
+    local mixed_player = new_player()
+    Bind['写入存档字段'](mixed_player, 104, 'ready', 'state')
+
+    local save_data = require 'y3.util.save_data'
+    local mixed_data = save_data.load_table(mixed_player, 104)
+    assert(mixed_data.state == 'ready', 'ECA 写过的字段必须能被 Lua 接口读到')
+
+    mixed_data.level = 3
+    drain_pending_writes(mixed_player, 104)
+    assert(Bind['读取存档字段'](mixed_player, 104, 'level') == 3,
+        'Lua 接口写过的字段必须能被 ECA 接口读到')
 end
 
 local function restore_runtime()
