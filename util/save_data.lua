@@ -9,6 +9,9 @@ local M = {}
 --   写进引擎内存存档，不需要任何显式上传/保存接口，`Player:upload_save_data` 不是保存它的途径。
 -- * 只有「先建父表、再写子字段」这类嵌套字段会被暂存，约 0.03s 后的 flush 轮次自动写进内存；
 --   `$Y3-即将切换关卡` 前会统一排空。
+-- * 写嵌套字段（key2 / key3）前，父级必须是表：原生已是表、或本轮刚建 / 暂存队列里即将落盘的
+--   表都算。父级缺失或不是表时直接报错（与 ECA 一致），不依赖引擎按 key1/key2/key3 静默补建
+--   中间表——那会把已删除或不存在的路径重新写出来。
 -- * 暂存/重试中的字段在 Lua 侧立即可读（读取以 Lua 侧为准），写进内存后以原生值为准。
 ---@private
 M.table_cache = setmetatable({}, { __mode = 'k' })
@@ -140,6 +143,7 @@ M.player_tables = y3.util.multiTable(2)
 
 ---获取玩家的存档数据（表）。修改这个表中的字段会自动更新到存档中。
 ---禁止覆盖模式下最多支持 3 层嵌套（`data.a.b.c` 是最深的一层），第 4 层字段非法：写入或删除第 4 层字段会直接报错，读取第 4 层字段恒为 `nil`（因此遍历第 3 层表得到空表）。
+---写嵌套字段（key2 / key3）前父级必须是表（原生已是表，或同一轮里刚建/待落盘的表）；父级缺失或不是表时直接报错，不会静默补建中间表。
 ---> 编辑器已经不再支持允许覆盖模式。
 ---> 表内字段的写入是实时的：每次赋值都会立刻写进引擎内存中的存档表，不需要（也不应该）再调用
 ---> `y3.save_data.upload_save_data` 或 `Player:upload_save_data` 来保存（引擎负责把内存存档写进
@@ -480,8 +484,72 @@ function M.load_table_with_cover_disable(player, slot)
         end
     end
 
+    ---路径文本，仅用于报错：`a` / `a.b`
+    ---@param key1 any
+    ---@param key2 any
+    ---@return string
+    local function path_text(key1, key2)
+        if key2 == nil or key2 == '' then
+            return tostring(key1)
+        end
+        return ('%s.%s'):format(tostring(key1), tostring(key2))
+    end
+
+    --读取原生同路径的值，不做任何删除标记判断。
+    local function read_native_value(key1, key2, key3)
+        return player.handle:get_save_table_key_value(slot
+            , key1
+            , key2
+            , key3
+            ---@diagnostic disable-next-line: param-type-mismatch
+            , nil
+            , ''
+        )
+    end
+
+    --该层在「原生已是表」或「本会话即将建成表」的视角下是不是表。
+    --本轮刚建的表、暂存队列里等待落盘的表都算，其余以原生为准。
+    local function is_table_level(key1, key2)
+        if is_pending_table(key1, key2, '') or is_created_in_this_stage(key1, key2, '') then
+            return true
+        end
+        return type(read_native_value(key1, key2, '')) == 'table'
+    end
+
+    ---与 ECA 的路径语义对齐：写嵌套字段前，父级必须是表。
+    ---父级在原生已是表、或本会话刚建 / 暂存队列里即将建成表时放行；父级缺失或不是表时
+    ---直接报错，不依赖引擎按 key1/key2/key3 静默补建中间表（那会把已删除或不存在的
+    ---路径重新写出来）。删除分支不做这个校验：父表缺失时删除是 no-op，与 ECA 一致。
+    ---@param key1 any
+    ---@param key2 any
+    ---@param key3 any
+    local function check_parent_table(key1, key2, key3)
+        if key2 == nil or key2 == '' then
+            --顶层字段没有父级
+            return
+        end
+        local function assert_level(parent_key1, parent_key2)
+            if is_table_level(parent_key1, parent_key2) then
+                return
+            end
+            local text = path_text(parent_key1, parent_key2)
+            if read_native_value(parent_key1, parent_key2, '') == nil then
+                error(('存档路径的父表不存在：%s'):format(text))
+            end
+            error(('存档路径的父字段不是表：%s'):format(text))
+        end
+        --先查浅层：父字段是标量时，读它的子路径可能直接报错，浅层校验能先给出准确原因。
+        assert_level(key1, '')
+        if key3 ~= nil and key3 ~= '' then
+            assert_level(key1, key2)
+        end
+    end
+
     local function write_native(key1, key2, key3, value)
-        if type(value) == 'table' then
+        --写入前再校验一次父级：排空/重试路径上父表的建表写入可能已经失败并被放弃。
+        check_parent_table(key1, key2, key3)
+        local is_table = type(value) == 'table'
+        if is_table then
             value = {}
         end
         player.handle:set_save_table_key_value(slot
@@ -494,9 +562,13 @@ function M.load_table_with_cover_disable(player, slot)
         --已经落到原生，Lua 侧不再是这个字段的唯一持有者。
         unmark_unflushed(key1, key2, key3)
         unmark_deleted(key1, key2, key3)
-        if type(value) == 'table' then
+        if is_table then
             unmark_pending_table(key1, key2, key3)
             mark_created(key1, key2, key3)
+        else
+            --标量写入把该路径的子树整个换掉，其上「本轮已创建的表」标记（含子孙）随之失效，
+            --否则后续写子字段会被误判成「父表即将落盘」而暂存，错误/写入被推迟。
+            unmark_created(key1, key2, key3)
         end
     end
 
@@ -595,6 +667,8 @@ function M.load_table_with_cover_disable(player, slot)
         -- 同路径（及其子孙路径）里还挂着的暂存写入已被这次赋值取代：它们会在后续
         -- 轮次落盘，那时顺序已经不等于赋值顺序，甚至可能写进一个已经变成标量的
         -- 父表，所以必须一并撤销（删除分支同样会撤销这些暂存写入）。
+        -- 校验放在改标记之前：父级不合法时直接抛错，不留下任何状态。
+        check_parent_table(key1, key2, key3)
         remove_pending_writes(key1, key2, key3)
         unmark_deleted(key1, key2, key3)
         mark_unflushed(key1, key2, key3)
@@ -617,18 +691,6 @@ function M.load_table_with_cover_disable(player, slot)
         if type(value) == 'table' then
             schedule_flush()
         end
-    end
-
-    --读取原生同路径的值，不做任何删除标记判断。
-    local function read_native_value(key1, key2, key3)
-        return player.handle:get_save_table_key_value(slot
-            , key1
-            , key2
-            , key3
-            ---@diagnostic disable-next-line: param-type-mismatch
-            , nil
-            , ''
-        )
     end
 
     --删除标记只是本会话的读侧影子，只有「原生同路径确实为空」时才成立：
@@ -677,9 +739,9 @@ function M.load_table_with_cover_disable(player, slot)
             and    vtype ~= 'number' then
                 error('存档的值只能是基础类型')
             end
-            raw[key] = value
-
+            -- 先落 set_value：父级校验失败会抛错，此时不能在快照上留下一个读得到的影子值。
             set_value(key, value, path)
+            raw[key] = value
         end,
         anyGetter = function (self, raw, key, config, path)
             -- 第 4 层字段非法，该层不存在。

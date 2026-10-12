@@ -556,21 +556,24 @@ local function run_tests()
     end
 
     do
-        -- 删除父表时 pending_created 必须一起清：原生 remove 删的是整棵子树，
-        -- 残留的「本轮已创建」标记只会让后续写入无谓地多等一轮 flush。
+        -- 删除父表后，用仍持有的代理写它的子字段：父表在原生已经不存在，必须当场报错，
+        -- 不能靠引擎静默补建把 p 重新写出来。
+        -- 这里同时守着 pending_created 的清理：若残留「本轮已创建」标记，这次写入会被
+        -- 判成「父表即将落盘」而暂存，pcall 就不会失败，错误被推迟到 flush。
         local player = new_player()
         local data = save_data.load_table(player, 17)
 
         data.p = {}
         local captured = data.p
         data.p = nil
-        captured.x = 1
 
-        assert(find_call(player.calls, 'set', 'p', 'x', '', 1),
-            '删除父表后，子字段写入不得被残留的 pending_created 推迟')
+        local ok, err = pcall(function () captured.x = 1 end)
+        assert(not ok, '删除父表后写子字段必须报错')
+        assert(tostring(err):find('父表不存在：p', 1, true), tostring(err))
 
         fake_ltimer.debug_fastward(10)
-        assert(count_calls(player.calls, 'set', 'p', 'x', '', 1) == 1)
+        assert(count_calls(player.calls, 'set', 'p', 'x', '') == 0, '不得静默补建父表')
+        assert(player.storage[17].p == nil, '原生不得重新出现 p')
     end
 
     do
@@ -677,23 +680,22 @@ local function run_tests()
     end
 
     do
-        -- 三层写入只要路径上还有本轮刚建的祖先表，就必须等一轮：只看直接父表会漏掉
-        -- 「祖父表刚建、中间表不在代理的暂存记录里」的情况（例如地图脚本直接改了自己
-        -- 传进存档的那张表，代理并不知道中间表存在）。
+        -- 直接改「传进存档的那张表」（绕过代理）后，代理并不知道中间表存在：
+        -- 此时 a.b 只在 Lua 快照里，原生没有。写 a.b.c 必须报错，
+        -- 不能依赖引擎按 key1/key2/key3 静默补建 a.b。
         local player = new_player()
         local data = save_data.load_table(player, 24)
 
         local assigned = {}
         data.a = assigned
         assigned.b = {}
-        data.a.b.c = 1
 
-        assert(not find_call(player.calls, 'set', 'a', 'b', 'c'),
-            '祖父表本轮刚建时，三层写入不得与它同批下发')
+        local ok, err = pcall(function () data.a.b.c = 1 end)
+        assert(not ok, '中间表只存在于 Lua 侧时，三层写入必须报错')
+        assert(tostring(err):find('父表不存在：a.b', 1, true), tostring(err))
 
         fake_ltimer.debug_fastward(10)
-        assert(find_call(player.calls, 'set', 'a', 'b', 'c', 1))
-        assert(player.storage[24].a.b.c == 1)
+        assert(count_calls(player.calls, 'set', 'a', 'b', 'c') == 0, '不得静默补建中间表')
     end
 
     do
@@ -767,16 +769,18 @@ local function run_tests()
         assert(type(data.root.tbl) == 'table', '失败的字段仍必须能读回 Lua 侧的值')
         assert(data.root.val == 1)
 
-        -- 关键：放弃建表后，子字段写入不得再被残留的 pending_table 推迟，
-        -- 这一步必须立刻下发原生写入。
-        data.root.tbl.child = 1
-        assert(find_call(player.calls, 'set', 'root', 'tbl', 'child', 1),
-            '放弃建表后，子字段写入不得被残留的 pending_table 推迟')
+        -- 关键：放弃建表后，父表在原生并不存在。子字段写入必须当场报错，
+        -- 既不能靠残留的 pending_table 无限推迟，也不能让引擎静默补建。
+        -- 若 abandon 分支漏清 pending_table，这里会被判成「父表即将落盘」而暂存，
+        -- pcall 就不会失败。
+        local child_ok, child_err = pcall(function () data.root.tbl.child = 1 end)
+        assert(not child_ok, '父表被放弃后写子字段必须报错')
+        assert(tostring(child_err):find('父表不存在：root.tbl', 1, true), tostring(child_err))
+        assert(count_calls(player.calls, 'set', 'root', 'tbl', 'child') == 0, '不得静默补建父表')
         fake_ltimer.debug_fastward(10)
-        assert(player.storage[26].root.tbl.child == 1, '子字段必须落到原生')
+        assert(player.storage[26].root.tbl == nil, '原生不得出现 root.tbl')
 
-        -- drain 路径（切关卡 / 上传）必须能返回。若上面的标记清理被回退，
-        -- find_call 那条断言会先失败，不会走到这里挂住。
+        -- drain 路径（切关卡 / 上传）必须能返回：若残留标记让排空死循环，这里会挂住。
         assert(level_switch_callback)
         level_switch_callback()
 
@@ -785,6 +789,45 @@ local function run_tests()
         player.handle:set_save_table_key_value(26, 'root', 7, 'val', '', '')
         assert(player.storage[26].root.val == 7)
         assert(data.root.val == 7, '放弃写入后，原生的新值必须能被读到')
+    end
+
+    do
+        -- 与 ECA 的路径语义对齐：写嵌套字段前父级必须是表，否则当场报错，不静默补建。
+        local player = new_player({
+            [27] = {
+                a = { b = { c = 1 } },
+            },
+        })
+        local data = save_data.load_table(player, 27)
+
+        -- 父字段变成标量：key2 层
+        data.n = {}
+        local captured_scalar = data.n
+        data.n = 1
+        local ok1, err1 = pcall(function () captured_scalar.child = 2 end)
+        assert(not ok1, '父字段是标量时必须报错')
+        assert(tostring(err1):find('父字段不是表：n', 1, true), tostring(err1))
+
+        -- 父表已被删除，用旧代理写它的子字段：key3 层
+        local captured_table = data.a.b
+        data.a.b = nil
+        local ok2, err2 = pcall(function () captured_table.c = 2 end)
+        assert(not ok2, '父表被删除后写子字段必须报错')
+        assert(tostring(err2):find('父表不存在：a.b', 1, true), tostring(err2))
+
+        fake_ltimer.debug_fastward(10)
+        assert(count_calls(player.calls, 'set', 'n', 'child') == 0, '不得静默补建父表')
+        assert(count_calls(player.calls, 'set', 'a', 'b', 'c') == 0, '不得静默补建中间表')
+        assert(player.storage[27].n == 1, '标量父字段不得被覆盖')
+        assert(player.storage[27].a.b == nil, '被删除的父表不得被重新写出来')
+
+        -- 正常流程（先写空表建父表）必须照常工作
+        data.cfg = {}
+        data.cfg.sub = {}
+        data.cfg.sub.v = 1
+        fake_ltimer.debug_fastward(10)
+        assert(player.storage[27].cfg.sub.v == 1)
+        assert(data.cfg.sub.v == 1)
     end
 end
 
