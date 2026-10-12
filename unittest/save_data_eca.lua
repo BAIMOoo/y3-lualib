@@ -379,6 +379,24 @@ local function run_tests()
         assert(empty_key_errors[index]:find('不能是空字符串', 1, true), empty_key_errors[index])
     end
     assert(type(empty_key_player.storage[106].a) == 'table', '空 key 不得把父表覆盖成标量')
+
+    -- 父表刚建、还没落盘时，ECA 的删除不能误报「父表不存在」：删除前会把暂存写入排空。
+    local pending_player = new_player()
+    Bind['写入存档字段'](pending_player, 107, {}, 'a')
+    Bind['写入存档字段'](pending_player, 107, {}, 'a', 'b')
+    Bind['写入存档字段'](pending_player, 107, 1, 'a', 'b', 'c')
+
+    local previous_pending_error = capture_errors()
+    Bind['删除存档字段'](pending_player, 107, 'a', 'b', 'c')
+    local pending_errors = captured_errors
+    log.error = previous_pending_error
+
+    assert(#pending_errors == 0, '父表待落盘时删除不得报错，实际：' .. tostring(pending_errors[1]))
+    drain_pending_writes(pending_player, 107)
+    assert(type(pending_player.storage[107].a) == 'table')
+    assert(type(pending_player.storage[107].a.b) == 'table', '父表必须先落盘再执行删除')
+    assert(pending_player.storage[107].a.b.c == nil, '被删除的字段不得留在原生')
+    assert(Bind['判断字段是否存在'](pending_player, 107, 'a', 'b', 'c') == false)
 end
 
 local function restore_runtime()

@@ -897,6 +897,34 @@ local function run_tests()
     end
 
     do
+        -- 父表还在暂存队列里（本会话刚建、尚未落盘）时删除它的子字段：写入侧对同一种
+        -- 父级是延期，删除侧也必须能正常完成，而不是误报「父表不存在」（errcode 4）。
+        -- 删除前先把该槽位的暂存写入排空，父表才真正落盘。
+        local player = new_player()
+        local data = save_data.load_table(player, 30)
+
+        data.a = {}
+        data.a.b = {}
+        data.a.b.c = 1
+
+        local ok, err = pcall(function () data.a.b.c = nil end)
+        assert(ok, '父表待落盘时删除子字段必须成功，实际：' .. tostring(err))
+
+        fake_ltimer.debug_fastward(20)
+        assert(type(player.storage[30].a) == 'table')
+        assert(type(player.storage[30].a.b) == 'table', '父表必须先落盘再执行删除')
+        assert(player.storage[30].a.b.c == nil, '被删除的字段不得留在原生')
+
+        local set_index = find_call(player.calls, 'set', 'a', 'b', '')
+        local remove_index = find_call(player.calls, 'remove', 'a', 'b', 'c')
+        assert(set_index and remove_index and set_index < remove_index,
+            '父表写入必须排在删除之前')
+        assert(count_calls(player.calls, 'remove', 'a', 'b', 'c') == 1)
+        assert(count_calls(player.calls, 'set', 'a', 'b', 'c') == 0,
+            '被删除取代的暂存写入不得下发到原生')
+    end
+
+    do
         -- key 不能是空字符串：引擎用 `''` 表示「这一层没有 key」，第 2/3 层的空 key 会被
         -- 当成「没有这一层」，退化成对父级赋值，把父表整个覆盖成标量。
         local player = new_player()

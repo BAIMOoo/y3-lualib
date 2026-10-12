@@ -17,6 +17,9 @@ local M = {}
 -- * 暂存/重试中的字段在 Lua 侧立即可读（读取以 Lua 侧为准），写进内存后以原生值为准。
 -- * key 只能是字符串或整数，且不能是空字符串：引擎用 `''` 表示「这一层没有 key」，放行空
 --   字符串会让第 2/3 层的空 key 退化成对父级赋值（把父表整个覆盖掉），因此写入侧一律拒绝。
+-- * 删除不做延期（父级缺失 / 不是表时按 errcode 4 报错，与写入的「延期」不同）；但父级只是
+--   还没落盘（本会话刚建 / 还在暂存队列里）时，会先把该槽位的暂存写入排空再下发删除，
+--   否则刚建好的父表会被误判成「父表不存在」。
 ---@private
 M.table_cache = setmetatable({}, { __mode = 'k' })
 
@@ -531,6 +534,8 @@ function M.load_table_with_cover_disable(player, slot)
     ---直接报错（引擎自己也会拒绝这种写入并返回 errcode 4，这里提前拦是为了当场抛出并给出
     ---准确路径）。删除分支不做这个校验，直接交给引擎：父表缺失 / 不是表时同样按 errcode 4
     ---报错。这是有意的——删除一个不存在的路径按用法错误处理（ECA 侧是 no-op，两边刻意不同）。
+    ---父表只是还没落盘时不算「缺失」：删除会先排空暂存写入（见 `parent_chain_not_native`），
+    ---所以刚建好的表在被删除子字段前会先落盘，不会误报 errcode 4。
     ---@param key1 any
     ---@param key2 any
     ---@param key3 any
@@ -659,6 +664,27 @@ function M.load_table_with_cover_disable(player, slot)
 
     M.flush_save_table_map[player][slot] = flush_pending_writes
 
+    --删除前，父级链上是否还有「原生还不是表」的层。写入侧遇到这种父级会延期，删除侧
+    --不做延期，因此删除要先把这个槽位的暂存写入排空，父表才真正落盘、引擎才不会按
+    --errcode 4 拒绝。这里和 `check_parent_table` 的差别是只看原生，不看暂存队列。
+    ---@param key1 any
+    ---@param key2 any
+    ---@param key3 any
+    ---@return boolean
+    local function parent_chain_not_native(key1, key2, key3)
+        if key2 == nil or key2 == '' then
+            --顶层字段没有父级
+            return false
+        end
+        if type(read_native_value(key1, '', '')) ~= 'table' then
+            return true
+        end
+        if key3 ~= nil and key3 ~= '' then
+            return type(read_native_value(key1, key2, '')) ~= 'table'
+        end
+        return false
+    end
+
     local function set_value(key, value, path)
         local key1, key2, key3 = unpack_path(key, path)
         if value == nil then
@@ -666,6 +692,12 @@ function M.load_table_with_cover_disable(player, slot)
             unmark_pending_table(key1, key2, key3)
             unmark_created(key1, key2, key3)
             mark_deleted(key1, key2, key3)
+            --父表可能只是「本会话刚建 / 还在暂存队列里」，此时必须先让它落盘：引擎对
+            --非表父级返回 errcode 4，而写入侧对同一种情况是延期（不报错）。排空后父表
+            --若因写入失败仍未落盘，这里照旧按 errcode 4 报错，与「父表确实不存在」同义。
+            if parent_chain_not_native(key1, key2, key3) then
+                flush_pending_writes(true)
+            end
             player.handle:remove_save_table_key_value(slot
                 , key1
                 , key2
