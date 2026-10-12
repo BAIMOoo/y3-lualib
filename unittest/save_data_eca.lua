@@ -100,33 +100,47 @@ local function new_player()
         storage[slot] = storage[slot] or {}
         return storage[slot]
     end
+    -- 与引擎一致（table_api.py `_Up1SetTableValueAndCheckValid`）：父级不是表就报错
+    -- （errcode 4），不补建中间表。
+    local function check_parent_table(parent, key1, key2)
+        if type(parent) ~= 'table' then
+            local text = key2 == '' and tostring(key1) or (tostring(key1) .. '.' .. tostring(key2))
+            error('save_table_exceed_table_depth: ' .. text)
+        end
+    end
+
     local function set_value(slot, key1, value, key2, key3)
         local root = slot_data(slot)
         if key2 == '' then
             root[key1] = value
-        elseif key3 == '' then
-            root[key1] = root[key1] or {}
-            root[key1][key2] = value
-        else
-            root[key1] = root[key1] or {}
-            root[key1][key2] = root[key1][key2] or {}
-            root[key1][key2][key3] = value
+            return
         end
+        check_parent_table(root[key1], key1, '')
+        if key3 == '' then
+            root[key1][key2] = value
+            return
+        end
+        check_parent_table(root[key1][key2], key1, key2)
+        root[key1][key2][key3] = value
     end
     local function get_value(slot, key1, key2, key3)
         local root = slot_data(slot)
         if key2 == '' then
             return root[key1]
         end
+        -- 引擎按路径逐层走，遇到非表（缺失或标量）都返回 nil，不报错。
         local value = root[key1]
-        if value == nil then
+        if type(value) ~= 'table' then
             return nil
         end
         if key3 == '' then
             return value[key2]
         end
         value = value[key2]
-        return value and value[key3]
+        if type(value) ~= 'table' then
+            return nil
+        end
+        return value[key3]
     end
     local function remove_value(slot, key1, key2, key3)
         local root = slot_data(slot)
@@ -134,18 +148,14 @@ local function new_player()
             root[key1] = nil
             return
         end
-        local value = root[key1]
-        if not value then
-            return
-        end
+        -- 删除走同一套父级校验：父级不是表同样报错（errcode 4）。
+        check_parent_table(root[key1], key1, '')
         if key3 == '' then
-            value[key2] = nil
+            root[key1][key2] = nil
             return
         end
-        value = value[key2]
-        if value then
-            value[key3] = nil
-        end
+        check_parent_table(root[key1][key2], key1, key2)
+        root[key1][key2][key3] = nil
     end
 
     local handle = {

@@ -88,18 +88,34 @@ local function run_tests()
             return storage[slot]
         end
 
+        -- 路径文本，仅用于模拟引擎报错信息。
+        local function path_text(key1, key2)
+            if key2 == '' then
+                return tostring(key1)
+            end
+            return tostring(key1) .. '.' .. tostring(key2)
+        end
+
+        -- 与引擎一致（table_api.py `_Up1SetTableValueAndCheckValid`）：父级不是表就报错
+        -- （errcode 4），绝不补建中间表。假引擎若不这样，会放行真引擎必然拒绝的写入。
+        local function check_parent_table(parent, key1, key2)
+            if type(parent) ~= 'table' then
+                error('save_table_exceed_table_depth: ' .. path_text(key1, key2))
+            end
+        end
+
         local function set_path(slot, key1, key2, key3, value)
             local root = ensure_slot(slot)
             if key2 == '' then
                 root[key1] = value
                 return
             end
-            root[key1] = root[key1] or {}
+            check_parent_table(root[key1], key1, '')
             if key3 == '' then
                 root[key1][key2] = value
                 return
             end
-            root[key1][key2] = root[key1][key2] or {}
+            check_parent_table(root[key1][key2], key1, key2)
             root[key1][key2][key3] = value
         end
 
@@ -108,12 +124,19 @@ local function run_tests()
             if key2 == '' then
                 return root[key1]
             end
+            -- 引擎按路径逐层走，遇到非表（缺失或标量）都返回 nil，不报错。
             local value = root[key1]
-            if value == nil or key3 == '' then
-                return value and value[key2]
+            if type(value) ~= 'table' then
+                return nil
+            end
+            if key3 == '' then
+                return value[key2]
             end
             value = value[key2]
-            return value and value[key3]
+            if type(value) ~= 'table' then
+                return nil
+            end
+            return value[key3]
         end
 
         local function remove_path(slot, key1, key2, key3)
@@ -122,18 +145,14 @@ local function run_tests()
                 root[key1] = nil
                 return
             end
-            local value = root[key1]
-            if not value then
-                return
-            end
+            -- 引擎的删除走同一套父级校验：父级不是表同样报错（errcode 4）。
+            check_parent_table(root[key1], key1, '')
             if key3 == '' then
-                value[key2] = nil
+                root[key1][key2] = nil
                 return
             end
-            value = value[key2]
-            if value then
-                value[key3] = nil
-            end
+            check_parent_table(root[key1][key2], key1, key2)
+            root[key1][key2][key3] = nil
         end
 
         local function deep_copy(value)
@@ -161,6 +180,8 @@ local function run_tests()
             if type(value) == 'table' and next(value) ~= nil then
                 error('native table creation must receive an empty table')
             end
+            -- 先落盘再记录：引擎的父级校验失败时不会产生任何存档操作。
+            set_path(slot, key1, key2, key3, value)
             record({
                 op = 'set',
                 slot = slot,
@@ -171,7 +192,6 @@ local function run_tests()
                 value_type = type(value),
                 empty_table_value = type(value) == 'table' and next(value) == nil,
             })
-            set_path(slot, key1, key2, key3, value)
         end
 
         function handle:get_save_table_key_value(slot, key1, key2, key3)
@@ -179,6 +199,8 @@ local function run_tests()
         end
 
         function handle:remove_save_table_key_value(slot, key1, key2, key3)
+            -- 先落盘再记录：父级校验失败时不会产生任何存档操作。
+            remove_path(slot, key1, key2, key3)
             record({
                 op = 'remove',
                 slot = slot,
@@ -186,7 +208,6 @@ local function run_tests()
                 key2 = key2,
                 key3 = key3,
             })
-            remove_path(slot, key1, key2, key3)
         end
 
         function handle:upload_save_data()
@@ -556,8 +577,8 @@ local function run_tests()
     end
 
     do
-        -- 删除父表后，用仍持有的代理写它的子字段：父表在原生已经不存在，必须当场报错，
-        -- 不能靠引擎静默补建把 p 重新写出来。
+        -- 删除父表后，用仍持有的代理写它的子字段：父表在原生已经不存在，必须当场报错。
+        -- （引擎对该写入同样返回 errcode 4 报错、不会补建 p；这里提前拦是为了当场抛出。）
         -- 这里同时守着 pending_created 的清理：若残留「本轮已创建」标记，这次写入会被
         -- 判成「父表即将落盘」而暂存，pcall 就不会失败，错误被推迟到 flush。
         local player = new_player()
@@ -572,8 +593,8 @@ local function run_tests()
         assert(tostring(err):find('父表不存在：p', 1, true), tostring(err))
 
         fake_ltimer.debug_fastward(10)
-        assert(count_calls(player.calls, 'set', 'p', 'x', '') == 0, '不得静默补建父表')
-        assert(player.storage[17].p == nil, '原生不得重新出现 p')
+        assert(count_calls(player.calls, 'set', 'p', 'x', '') == 0, '不得把写入下发到原生')
+        assert(player.storage[17].p == nil, '原生不得出现 p')
     end
 
     do
@@ -681,8 +702,8 @@ local function run_tests()
 
     do
         -- 直接改「传进存档的那张表」（绕过代理）后，代理并不知道中间表存在：
-        -- 此时 a.b 只在 Lua 快照里，原生没有。写 a.b.c 必须报错，
-        -- 不能依赖引擎按 key1/key2/key3 静默补建 a.b。
+        -- 此时 a.b 只在 Lua 快照里，原生没有。写 a.b.c 必须报错
+        -- （引擎同样会返回 errcode 4，不会补建 a.b）。
         local player = new_player()
         local data = save_data.load_table(player, 24)
 
@@ -695,7 +716,7 @@ local function run_tests()
         assert(tostring(err):find('父表不存在：a.b', 1, true), tostring(err))
 
         fake_ltimer.debug_fastward(10)
-        assert(count_calls(player.calls, 'set', 'a', 'b', 'c') == 0, '不得静默补建中间表')
+        assert(count_calls(player.calls, 'set', 'a', 'b', 'c') == 0, '不得把写入下发到原生')
     end
 
     do
@@ -770,13 +791,14 @@ local function run_tests()
         assert(data.root.val == 1)
 
         -- 关键：放弃建表后，父表在原生并不存在。子字段写入必须当场报错，
-        -- 既不能靠残留的 pending_table 无限推迟，也不能让引擎静默补建。
+        -- 既不能靠残留的 pending_table 无限推迟，也不能把写入下发到原生
+        -- （引擎对缺失父级返回 errcode 4，不会补建）。
         -- 若 abandon 分支漏清 pending_table，这里会被判成「父表即将落盘」而暂存，
         -- pcall 就不会失败。
         local child_ok, child_err = pcall(function () data.root.tbl.child = 1 end)
         assert(not child_ok, '父表被放弃后写子字段必须报错')
         assert(tostring(child_err):find('父表不存在：root.tbl', 1, true), tostring(child_err))
-        assert(count_calls(player.calls, 'set', 'root', 'tbl', 'child') == 0, '不得静默补建父表')
+        assert(count_calls(player.calls, 'set', 'root', 'tbl', 'child') == 0, '不得把写入下发到原生')
         fake_ltimer.debug_fastward(10)
         assert(player.storage[26].root.tbl == nil, '原生不得出现 root.tbl')
 
@@ -792,7 +814,8 @@ local function run_tests()
     end
 
     do
-        -- 与 ECA 的路径语义对齐：写嵌套字段前父级必须是表，否则当场报错，不静默补建。
+        -- 与 ECA 的路径语义对齐：写嵌套字段前父级必须是表，否则当场报错
+        -- （引擎也会拒绝并返回 errcode 4，不会补建中间表）。
         local player = new_player({
             [27] = {
                 a = { b = { c = 1 } },
@@ -816,8 +839,8 @@ local function run_tests()
         assert(tostring(err2):find('父表不存在：a.b', 1, true), tostring(err2))
 
         fake_ltimer.debug_fastward(10)
-        assert(count_calls(player.calls, 'set', 'n', 'child') == 0, '不得静默补建父表')
-        assert(count_calls(player.calls, 'set', 'a', 'b', 'c') == 0, '不得静默补建中间表')
+        assert(count_calls(player.calls, 'set', 'n', 'child') == 0, '不得把写入下发到原生')
+        assert(count_calls(player.calls, 'set', 'a', 'b', 'c') == 0, '不得把写入下发到原生')
         assert(player.storage[27].n == 1, '标量父字段不得被覆盖')
         assert(player.storage[27].a.b == nil, '被删除的父表不得被重新写出来')
 
@@ -828,6 +851,49 @@ local function run_tests()
         fake_ltimer.debug_fastward(10)
         assert(player.storage[27].cfg.sub.v == 1)
         assert(data.cfg.sub.v == 1)
+    end
+
+    do
+        -- 假引擎保真度：原生层的父级校验必须和真引擎一致（table_api.py
+        -- `_Up1SetTableValueAndCheckValid`）。这条用例不经过代理，直接打原生接口：
+        -- 万一以后 Lua 层的父级校验被绕过或回退，原生层仍要拒绝，而不是补建中间表。
+        local player = new_player()
+        save_data.load_table(player, 28)
+
+        local ok1, err1 = pcall(function ()
+            player.handle:set_save_table_key_value(28, 'a', 1, 'b', '', '')
+        end)
+        assert(not ok1, '父表缺失时原生写入必须报错')
+        assert(tostring(err1):find('save_table_exceed_table_depth', 1, true), tostring(err1))
+        assert(player.storage[28] == nil or player.storage[28].a == nil, '不得补建父表')
+
+        -- 读取遇到非表父级返回 nil（引擎逐层走路径，不报错）
+        player.storage[28] = { a = 1 }
+        assert(player.handle:get_save_table_key_value(28, 'a', 'b', '') == nil)
+
+        -- 删除同样受父级校验约束（引擎 errcode 4）
+        local ok2, err2 = pcall(function ()
+            player.handle:remove_save_table_key_value(28, 'a', 'b', '')
+        end)
+        assert(not ok2, '父字段不是表时原生删除必须报错')
+        assert(tostring(err2):find('save_table_exceed_table_depth', 1, true), tostring(err2))
+        assert(player.storage[28].a == 1, '删除报错后原生不得被改动')
+    end
+
+    do
+        -- 删除分支刻意不做父级校验、直接交给引擎：父表缺失 / 不是表时报错（沿用引擎语义，
+        -- 与 ECA 侧的 no-op 是有意的差异，不要"顺手对齐"成 no-op）。
+        local player = new_player()
+        local data = save_data.load_table(player, 29)
+
+        data.p = {}
+        local captured = data.p
+        data.p = nil
+
+        local ok, err = pcall(function () captured.x = nil end)
+        assert(not ok, '父表缺失时删除子字段必须报错（沿用引擎语义）')
+        assert(tostring(err):find('save_table_exceed_table_depth', 1, true), tostring(err))
+        assert(player.storage[29].p == nil, '删除报错后原生不得被改动')
     end
 end
 
