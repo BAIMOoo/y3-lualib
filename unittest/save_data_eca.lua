@@ -334,6 +334,31 @@ local function run_tests()
     drain_pending_writes(mixed_player, 104)
     assert(Bind['读取存档字段'](mixed_player, 104, 'level') == 3,
         'Lua 接口写过的字段必须能被 ECA 接口读到')
+
+    -- 回归：读表字段必须返回普通表。代理自带 [CONFIG]/[CUSTOM] 哨兵键，py 层是按 next
+    -- 硬遍历的，拿到代理就只能看到这两个表键、看不到真实字段（引擎内实测：
+    -- GlobalAPI.table_iterator(代理) 返回两个以表为键的条目，脱壳后才是 [('a',7),('b','hi')]）。
+    local table_player = new_player()
+    Bind['写入存档字段'](table_player, 105, {}, 'box')
+    Bind['写入存档字段'](table_player, 105, 7, 'box', 'a')
+    Bind['写入存档字段'](table_player, 105, 'hi', 'box', 'b')
+
+    local box = Bind['读取存档字段'](table_player, 105, 'box')
+    assert(type(box) == 'table', '读表字段必须返回表')
+    assert(getmetatable(box) == nil, '读表字段必须返回普通表，不能是代理')
+    local keys = {}
+    for k in next, box do
+        keys[#keys + 1] = tostring(k)
+    end
+    table.sort(keys)
+    assert(#keys == 2 and keys[1] == 'a' and keys[2] == 'b',
+        '用 next 遍历表字段必须只看到真实字段，实际：' .. table.concat(keys, ', '))
+    assert(box.a == 7 and box.b == 'hi', '表字段内容必须完整')
+
+    -- 标量与 nil 的读取语义不变
+    Bind['写入存档字段'](table_player, 105, 9, 'scalar')
+    assert(Bind['读取存档字段'](table_player, 105, 'scalar') == 9)
+    assert(Bind['读取存档字段'](table_player, 105, 'none') == nil)
 end
 
 local function restore_runtime()

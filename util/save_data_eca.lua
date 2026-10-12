@@ -129,7 +129,10 @@ local function read_field(player, slot, key1, key2, key3)
             value = value[key3]
         end
     end
-    return y3.helper.as_lua(value)
+    -- 返回值会原样交给 py 层，这里必须交普通表：代理自带 [CONFIG]/[CUSTOM] 哨兵键，
+    -- py 层按 next 迭代只能读到这两个表键，读不到真实字段。非表值 raw 原样返回，
+    -- 所以标量 / nil 的语义不变。
+    return y3.proxy.raw(y3.helper.as_lua(value))
 end
 
 ---@param player Player
