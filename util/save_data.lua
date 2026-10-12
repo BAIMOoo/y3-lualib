@@ -15,6 +15,8 @@ local M = {}
 --   中间表），这里提前拦是为了当场抛出、给出准确路径，并避免写入排到 flush 后才失败、
 --   被当成可重试写入反复重试再放弃。
 -- * 暂存/重试中的字段在 Lua 侧立即可读（读取以 Lua 侧为准），写进内存后以原生值为准。
+-- * key 只能是字符串或整数，且不能是空字符串：引擎用 `''` 表示「这一层没有 key」，放行空
+--   字符串会让第 2/3 层的空 key 退化成对父级赋值（把父表整个覆盖掉），因此写入侧一律拒绝。
 ---@private
 M.table_cache = setmetatable({}, { __mode = 'k' })
 
@@ -146,6 +148,7 @@ M.player_tables = y3.util.multiTable(2)
 ---获取玩家的存档数据（表）。修改这个表中的字段会自动更新到存档中。
 ---禁止覆盖模式下最多支持 3 层嵌套（`data.a.b.c` 是最深的一层），第 4 层字段非法：写入或删除第 4 层字段会直接报错，读取第 4 层字段恒为 `nil`（因此遍历第 3 层表得到空表）。
 ---写嵌套字段（key2 / key3）前父级必须是表（原生已是表，或同一轮里刚建/待落盘的表）；父级缺失或不是表时直接报错（引擎自己也会拒绝这种写入并返回 errcode 4，这里提前拦是为了当场抛出并给出准确路径）。
+---key 只能是字符串或整数，且不能是空字符串（引擎用 `''` 表示「这一层没有 key」），否则写入会报错。
 ---> 编辑器已经不再支持允许覆盖模式。
 ---> 表内字段的写入是实时的：每次赋值都会立刻写进引擎内存中的存档表，不需要（也不应该）再调用
 ---> `y3.save_data.upload_save_data` 或 `Player:upload_save_data` 来保存（引擎负责把内存存档写进
@@ -289,6 +292,11 @@ function M.load_table_with_cover_enable(player, slot)
             if type(key) ~= 'string'
             and math.type(key) ~= 'integer' then
                 error('存档的key必须是字符串或者整数')
+            end
+            -- 引擎用空字符串表示「这一层没有 key」，放行空字符串会让第 2/3 层的空 key
+            -- 退化成对父级赋值（把父表整个覆盖掉），因此统一拒绝（见文件头注释）。
+            if key == '' then
+                error('存档的key不能是空字符串')
             end
             value = y3.helper.as_lua(value)
             local vtype = type(value)
@@ -720,6 +728,11 @@ function M.load_table_with_cover_disable(player, slot)
             if type(key) ~= 'string'
             and math.type(key) ~= 'integer' then
                 error('表的key必须是字符串或者整数')
+            end
+            -- 引擎用空字符串表示「这一层没有 key」，放行空字符串会让第 2/3 层的空 key
+            -- 退化成对父级赋值（把父表整个覆盖掉），因此统一拒绝（见文件头注释）。
+            if key == '' then
+                error('存档的key不能是空字符串')
             end
             -- 原生接口只有 key1/key2/key3，第 4 层字段无法表示：
             -- 若继续放行，写入会被截断到第 3 层（覆盖父表），删除会连带删掉整个子树。

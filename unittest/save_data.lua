@@ -895,6 +895,35 @@ local function run_tests()
         assert(tostring(err):find('save_table_exceed_table_depth', 1, true), tostring(err))
         assert(player.storage[29].p == nil, '删除报错后原生不得被改动')
     end
+
+    do
+        -- key 不能是空字符串：引擎用 `''` 表示「这一层没有 key」，第 2/3 层的空 key 会被
+        -- 当成「没有这一层」，退化成对父级赋值，把父表整个覆盖成标量。
+        local player = new_player()
+        local data = save_data.load_table(player, 31)
+
+        data.a = {}
+
+        local ok1, err1 = pcall(function () data[''] = 1 end)
+        assert(not ok1, '第 1 层空字符串 key 必须报错')
+        assert(tostring(err1):find('不能是空字符串', 1, true), tostring(err1))
+
+        local ok2, err2 = pcall(function () data.a[''] = 1 end)
+        assert(not ok2, '第 2 层空字符串 key 必须报错')
+        assert(tostring(err2):find('不能是空字符串', 1, true), tostring(err2))
+
+        data.a.b = {}
+        local ok3, err3 = pcall(function () data.a.b[''] = 1 end)
+        assert(not ok3, '第 3 层空字符串 key 必须报错')
+        assert(tostring(err3):find('不能是空字符串', 1, true), tostring(err3))
+
+        fake_ltimer.debug_fastward(20)
+        assert(type(player.storage[31].a) == 'table', '父表不得被空 key 覆盖成标量')
+        assert(type(player.storage[31].a.b) == 'table', '第 2 层表不得被空 key 覆盖成标量')
+        assert(find_call(player.calls, 'set', '', '', '', 1) == nil, '空 key 不得下发到原生')
+        assert(find_call(player.calls, 'set', 'a', '', '', 1) == nil, '空 key 不得下发到原生')
+        assert(find_call(player.calls, 'set', 'a', 'b', '', 1) == nil, '空 key 不得下发到原生')
+    end
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

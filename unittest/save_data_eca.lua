@@ -359,6 +359,26 @@ local function run_tests()
     Bind['写入存档字段'](table_player, 105, 9, 'scalar')
     assert(Bind['读取存档字段'](table_player, 105, 'scalar') == 9)
     assert(Bind['读取存档字段'](table_player, 105, 'none') == nil)
+
+    -- key 不能是空字符串：空 key 在引擎里表示「这一层没有 key」，继续放行会让第 2/3 层的
+    -- 空 key 退化成对父级赋值，把父表整个覆盖成标量。ECA 的可选 key 输入框最容易给出
+    -- 空字符串，因此写入 / 读取 / 删除都必须在入口拦掉。
+    local empty_key_player = new_player()
+    Bind['写入存档字段'](empty_key_player, 106, {}, 'a')
+
+    local previous_empty_key_error = capture_errors()
+    Bind['写入存档字段'](empty_key_player, 106, 1, 'a', '')
+    Bind['读取存档字段'](empty_key_player, 106, 'a', '')
+    Bind['删除存档字段'](empty_key_player, 106, '', 'b')
+    local empty_key_errors = captured_errors
+    log.error = previous_empty_key_error
+
+    assert(#empty_key_errors == 3, '空字符串 key 的写入 / 读取 / 删除都必须报错，实际：'
+        .. tostring(#empty_key_errors))
+    for index = 1, #empty_key_errors do
+        assert(empty_key_errors[index]:find('不能是空字符串', 1, true), empty_key_errors[index])
+    end
+    assert(type(empty_key_player.storage[106].a) == 'table', '空 key 不得把父表覆盖成标量')
 end
 
 local function restore_runtime()
