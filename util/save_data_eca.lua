@@ -109,6 +109,28 @@ local function get_target(data, key1, key2, key3, must_exist)
     return target, key1
 end
 
+---把带元表的「视图表」物化成普通 Lua 表。
+---在平台（在线）构建里，引擎交回来的实时存档表是「字段藏在 __pairs 后面、raw 键为空」
+---的视图；py 层（ECA「遍历表」→ `GameAPI:table_iterator` → `_Up1GetPairs`）是按原生
+---pairs 遍历的，视图里的字段一条都拿不到（实测线上遍历出 0 条）。因此凡是带元表的表
+---都先物化成普通表再交出去；本来就是普通表（无元表）的原样返回，保持原来的身份语义。
+---@param value any
+---@param depth? integer
+---@return any
+local function to_plain_table(value, depth)
+    if type(value) ~= 'table' or getmetatable(value) == nil then
+        return value
+    end
+    if (depth or 1) > 8 then
+        return value
+    end
+    local result = {}
+    for k, v in pairs(value) do
+        result[k] = to_plain_table(v, (depth or 1) + 1)
+    end
+    return result
+end
+
 ---@param player Player
 ---@param slot integer
 ---@param key1 string|integer
@@ -140,7 +162,14 @@ local function read_field(player, slot, key1, key2, key3)
     -- 返回值会原样交给 py 层，这里必须交普通表：代理自带 [CONFIG]/[CUSTOM] 哨兵键，
     -- py 层按 next 迭代只能读到这两个表键，读不到真实字段。非表值 raw 原样返回，
     -- 所以标量 / nil 的语义不变。
-    return y3.proxy.raw(y3.helper.as_lua(value))
+    value = y3.proxy.raw(y3.helper.as_lua(value))
+    local ok, plain = pcall(to_plain_table, value)
+    if ok then
+        return plain
+    end
+    -- 物化失败（元表不支持 pairs 之类）时退回原来的值：Lua 侧按 __index 仍可读，
+    -- 总好过把读操作变成报错。
+    return value
 end
 
 ---@param player Player

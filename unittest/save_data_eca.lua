@@ -397,6 +397,45 @@ local function run_tests()
     assert(type(pending_player.storage[107].a.b) == 'table', '父表必须先落盘再执行删除')
     assert(pending_player.storage[107].a.b.c == nil, '被删除的字段不得留在原生')
     assert(Bind['判断字段是否存在'](pending_player, 107, 'a', 'b', 'c') == false)
+
+    do
+        -- 平台（在线）构建里，引擎交回来的实时存档表是「字段藏在 __pairs 后面、raw 键为空」
+        -- 的视图表（元表受保护）。py 层（ECA「遍历表」→ GameAPI:table_iterator →
+        -- _Up1GetPairs）是按原生 pairs 遍历的，视图里的字段一条都读不到 —— 线上实测
+        -- `py items = []`。所以读表字段必须先把带元表的表物化成普通表再交出去。
+        local player = new_player()
+        local raw_view = setmetatable({
+            a = 7,
+            b = 'hi',
+            inner = setmetatable({ c = 1 }, { __metatable = 'up123' }),
+        }, { __metatable = 'up123' })
+        player.storage[108] = { box = raw_view }
+
+        local box = Bind['读取存档字段'](player, 108, 'box')
+        assert(type(box) == 'table', '读表字段必须返回表')
+        assert(getmetatable(box) == nil, '带元表的视图表必须被物化成普通表')
+        assert(box ~= raw_view, '物化后不能还是原来那张视图表')
+        local keys = {}
+        for k in next, box do
+            keys[#keys + 1] = tostring(k)
+        end
+        table.sort(keys)
+        assert(table.concat(keys, ',') == 'a,b,inner',
+            '普通表的 raw 键必须就是真实字段（py 层只会按 raw 键遍历），实际：' .. table.concat(keys, ','))
+        assert(box.a == 7 and box.b == 'hi', '字段值必须完整')
+        assert(getmetatable(box.inner) == nil and box.inner.c == 1, '嵌套的视图表也要一并物化')
+        assert(box.d == nil, '不存在的字段仍然是 nil')
+
+        -- 本来就是普通表（无元表）时保持原对象，不做多余拷贝。
+        local plain = { x = 1 }
+        player.storage[109] = { box = plain }
+        assert(Bind['读取存档字段'](player, 109, 'box') == plain, '普通表必须原样返回（保持身份）')
+
+        -- 标量 / nil 语义不变
+        player.storage[109].s = 5
+        assert(Bind['读取存档字段'](player, 109, 's') == 5)
+        assert(Bind['读取存档字段'](player, 109, 'none') == nil)
+    end
 end
 
 local function restore_runtime()
