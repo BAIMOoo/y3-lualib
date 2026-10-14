@@ -308,22 +308,17 @@ end
 ---把一张表整体写入玩家存档：这张表就是该子树的最终内容（`key1` / `key2` 是路径，缺省为槽位根）。
 ---未出现在表里的键（任意层）都会被删除，空表表示清空该子树。详见 `y3.save_data.set_table`。
 ---@param slot integer 存档槽位
----@param t table 该子树的最终内容
----@param key1? string|integer
----@param key2? string|integer
-function M:set_save_table(slot, t, key1, key2)
-    return y3.save_data.set_table(self, slot, t, key1, key2)
+---@param ... string|integer|table 0~2 层路径 key，最后一个是该子树的最终内容
+function M:set_save_table(slot, ...)
+    return y3.save_data.set_table(self, slot, ...)
 end
 
 ---按路径写一个存档字段，值可以是标量或一张表（值填 `nil` 等于删除）。
 ---路径上缺失 / 不是表的父级是否自动补建取决于 `y3.save_data.auto`。详见 `y3.save_data.set_field`。
 ---@param slot integer 存档槽位
----@param value any
----@param key1 string|integer
----@param key2? string|integer
----@param key3? string|integer
-function M:set_save_field(slot, value, key1, key2, key3)
-    return y3.save_data.set_field(self, slot, value, key1, key2, key3)
+---@param ... any 1~3 层路径 key（只能是字符串或整数），最后一个是值
+function M:set_save_field(slot, ...)
+    return y3.save_data.set_field(self, slot, ...)
 end
 
 ---增加全局存档

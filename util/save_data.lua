@@ -1096,7 +1096,11 @@ function M.load_table_with_cover_disable(player, slot)
     return proxy_save_data
 end
 
----把一张表整体写入存档：这张表就是该子树（`key1` / `key2` 指定，都缺省时为槽位根）的最终内容。
+---把一张表整体写入存档：这张表就是该子树的最终内容（key 在前、值在最后）。
+---
+---    y3.save_data.set_table(player, slot, t)                   -- 整个槽位根
+---    y3.save_data.set_table(player, slot, key1, t)
+---    y3.save_data.set_table(player, slot, key1, key2, t)
 ---
 ---未出现在表里的键（任意层）都会被删除；空表表示该键位变成一个空表（在根上就是清空整个槽位）。
 ---传入表最多 `3 - 路径层数` 层，超出报错；键与值的规则和表存档一致。
@@ -1104,22 +1108,34 @@ end
 ---与现值相同的字段不会产生原生写入。
 ---
 ---等价写法：`y3.save_data.load_table(player, slot)[key1][key2] = t`。
----（注意 `key1` / `key2` 是**路径**，缺失的层是否自动补建取决于 `y3.save_data.auto`。）
+---（注意 key 是**路径**，缺失的层是否自动补建取决于 `y3.save_data.auto`。）
 ---@param player Player
 ---@param slot integer
----@param t table 该子树的最终内容
----@param key1? string|integer
----@param key2? string|integer
-function M.set_table(player, slot, t, key1, key2)
+---@param ... string|integer|table 0~2 层路径 key，最后一个是该子树的最终内容
+function M.set_table(player, slot, ...)
+    local count = select('#', ...)
+    if count == 0 then
+        error('缺少要写入的表：set_table(player, slot, [key1, [key2, ]]t)')
+    end
+    local t = select(count, ...)
     if type(t) ~= 'table' then
         error('存档的值只能是基础类型')
     end
+    local keys = {}
+    for i = 1, count - 1 do
+        keys[i] = select(i, ...)
+        check_key(keys[i])
+    end
+    if #keys > 2 then
+        error('存档路径最多两层 key：set_table(player, slot, key1, key2, t)')
+    end
     local data = M.load_table(player, slot)
     local target = M.to_plain_table(t)
-    if key1 == nil then
+    if #keys == 0 then
         validate_save_table(target, 1, 3, '<存档根>')
-        -- 根上只能逐键增删：原生没有「把整张表写到根」的操作（key1/key2/key3 是位置式的 key，
-        -- 根表本身没有 key）。所以根清空就是逐个删除顶层字段。
+        -- 根上只能逐键增删：字段级接口要求 key1 非空（引擎对 key1 == '' 直接报
+        -- invalid save table key1），而整表写入接口（set_save_data_table_value）只允许
+        -- 覆盖模式的槽位使用，禁止覆盖槽位会当场抛错。所以根清空就是逐个删除顶层字段。
         for k in pairs(data) do
             if target[k] == nil then
                 data[k] = nil
@@ -1133,12 +1149,6 @@ function M.set_table(player, slot, t, key1, key2)
         end
         return
     end
-    local keys = { key1 }
-    check_key(key1)
-    if key2 ~= nil then
-        check_key(key2)
-        keys[2] = key2
-    end
     local parent, key, err = M.resolve_write_parent(data, keys)
     if not parent then
         error(err)
@@ -1146,32 +1156,31 @@ function M.set_table(player, slot, t, key1, key2)
     parent[key] = target
 end
 
----按路径写一个字段（与 ECA 的「写入存档字段」节点对应），值可以是标量或一张表。
----值是表时等价于 `y3.save_data.set_table(player, slot, value, key1, key2)`；值填 `nil` 等于删除。
+---按路径写一个字段（与 ECA 的「写入存档字段」节点对应），值可以是标量或一张表（key 在前、值在最后）。
+---
+---    y3.save_data.set_field(player, slot, key1, value)
+---    y3.save_data.set_field(player, slot, key1, key2, value)
+---    y3.save_data.set_field(player, slot, key1, key2, key3, value)
+---
+---值是表时等价于 `y3.save_data.set_table(player, slot, key1, key2, value)`；值填 `nil` 等于删除。
 ---路径上缺失 / 不是表的父级是否自动补建，取决于 `y3.save_data.auto`。
 ---@param player Player
 ---@param slot integer
----@param value any
----@param key1 string|integer
----@param key2? string|integer
----@param key3? string|integer
-function M.set_field(player, slot, value, key1, key2, key3)
-    if key1 == nil then
-        error('存档的第一个key不能为空')
+---@param ... any 1~3 层路径 key（只能是字符串或整数），最后一个是值
+function M.set_field(player, slot, ...)
+    local count = select('#', ...)
+    if count < 2 then
+        error('缺少存档路径的 key：set_field(player, slot, key1, value)')
     end
-    if key2 == nil and key3 ~= nil then
-        error('存档路径不能跳过第二层key')
+    if count > 4 then
+        error('存档路径最多三层 key：set_field(player, slot, key1, key2, key3, value)')
     end
-    local keys = { key1 }
-    check_key(key1)
-    if key2 ~= nil then
-        check_key(key2)
-        keys[2] = key2
-        if key3 ~= nil then
-            check_key(key3)
-            keys[3] = key3
-        end
+    local keys = {}
+    for i = 1, count - 1 do
+        keys[i] = select(i, ...)
+        check_key(keys[i])
     end
+    local value = select(count, ...)
     local data = M.load_table(player, slot)
     local parent, key, err = M.resolve_write_parent(data, keys)
     if not parent then

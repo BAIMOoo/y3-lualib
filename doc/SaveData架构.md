@@ -25,8 +25,8 @@
 
 ### 新增能力
 
-- **一次设置一整张表**：`y3.save_data.set_table(player, slot, t, key1?, key2?)` 把一棵子树整体替换成 `t`；`data.hero = { ... }` 是它的等价写法。
-- **按路径写一个值**：`y3.save_data.set_field(player, slot, value, key1?, key2?, key3?)`，与 ECA 的「写入存档字段」节点一一对应。
+- **一次设置一整张表**：`y3.save_data.set_table(player, slot, [key1, [key2, ]]t)` 把一棵子树整体替换成 `t`（key 在前、值在最后，key 可以不给）；`data.hero = { ... }` 是它的等价写法。
+- **按路径写一个值**：`y3.save_data.set_field(player, slot, key1, [key2, [key3, ]]value)`，与 ECA 的「写入存档字段」节点一一对应（注意 ECA 节点的参数顺序是「值在 key 前面」，两者刻意不同）。
 - **`y3.save_data.auto`**（默认 `false`）：打开后，按路径写入时路径上缺的层会自动建出来、不是表的层会换成表。
 - ECA 的「写入存档字段」节点同样支持：值填一张非空表 = 整树替换。
 
@@ -38,7 +38,7 @@
 | 读第 4 层：`data.a.b.c.d` | 返回的不是这个字段，而是第 3 层那张表 | 返回 `nil` |
 | key 用空字符串：`data.a[''] = 1` | 不报错，但实际把父表 `data.a` 整个覆盖了 | 直接报错 |
 | 给字段赋一张非空表：`data.hero = { name = 'knight' }` | 报错 | 合法：等于把那棵子树整体替换成这张表，多出来的键会被删掉 |
-| 深路径缺父表：`set_field(player, slot, 1, 'a', 'b')` | 报错 | 默认仍报错；`y3.save_data.auto = true` 会先把 `a` 建出来 |
+| 深路径缺父表：`set_field(player, slot, 'a', 'b', 1)` | 报错 | 默认仍报错；`y3.save_data.auto = true` 会先把 `a` 建出来 |
 
 第 4 层在旧版是「能读会读错、能写会写错」的半支持状态，新版统一按不支持处理：表最多三层。
 
@@ -122,21 +122,22 @@ y3.save_data.set_table(player, slot, {
     hero = { name = 'knight', hp = 100 },
 })
 
--- 只写 hero 这棵子树（第 4/5 个参数是路径 key1/key2）
-y3.save_data.set_table(player, slot, { name = 'knight' }, 'hero')
+-- 只写 hero 这棵子树（'hero' 是路径 key，表放最后）
+y3.save_data.set_table(player, slot, 'hero', { name = 'knight' })
 
 -- 等价写法
 local data = y3.save_data.load_table(player, slot)
 data.hero = { name = 'knight' }
 
--- 只写一个字段（值可以是标量，也可以是表）；值填 nil 等于删除
-y3.save_data.set_field(player, slot, 100, 'hero', 'hp')
-y3.save_data.set_field(player, slot, nil, 'hero', 'name')
+-- 只写一个字段（值可以是标量，也可以是表）；值填 nil 等于删除。key 在前、值在最后。
+y3.save_data.set_field(player, slot, 'hero', 'hp', 100)
+y3.save_data.set_field(player, slot, 'hero', 'name', nil)
 ```
 
 要点：
 
 - 语义是**替换**不是合并：`set_table(player, slot, { a = 1 })` 之后，槽位里只剩 `a`。想保留其它字段，就把它们一起写进表里。
+- 路径 key 全部写在值的前面：`set_table(player, slot, 'a', 'b', t)` 是「把 `a.b` 替换成 `t`」。key 的个数就是参数个数减一，所以 `set_field(player, slot, 'a', 'b', 'c')` 会被理解为「key 是 `a`、`b`，值是 `c`」。
 - 传入表最多 `3 - 路径层数` 层；超出、key 非法、值类型非法都会在**写入之前**整体报错，不会只写进去一半。
 - 与现值相同的字段不会重复写进存档；目标为空表时，子树是用「写一张空表覆盖」清掉的（一次操作，不会逐键删除）。
 - `data.hero = {...}` 之后请重新从 `data` 上取（`data.hero.name`）；替换前就抓在手里的那张子表引用不保证跟着更新。
@@ -148,7 +149,7 @@ y3.save_data.set_field(player, slot, nil, 'hero', 'name')
 
 ```lua
 y3.save_data.auto = true
-y3.save_data.set_field(player, slot, 1, 'a', 'b', 'c')   -- a 不存在 → 自动建 a、a.b 再写
+y3.save_data.set_field(player, slot, 'a', 'b', 'c', 1)   -- a 不存在 → 自动建 a、a.b 再写
 ```
 
 - 打开后，路径上**缺的层会建出来、不是表的层会换成表**，保证这次写入一定落地；换掉一个已存在的非表值时会打一条 `log.warn`（记录被丢弃的旧值）。
@@ -177,6 +178,7 @@ y3.save_data.set_field(player, slot, 1, 'a', 'b', 'c')   -- a 不存在 → 自�
 
 - 写入或读取一个父表不存在的路径会报错，按上面的方式先建父表；`y3.save_data.auto = true` 时写入会自动把缺的层建出来。
 - 删除一个不存在的路径不做任何事。
+- ECA 节点的参数顺序是「值在 key 前面」（`写入存档字段(玩家, 槽位, 值, key1, ...)`），与 Lua 的 `set_field`（key 在前、值在最后）刻意不同：节点的顺序已经定死并被存量图按位置引用，不能改。
 
 ## 注意事项
 

@@ -995,7 +995,7 @@ local function run_tests()
         })
         save_data.load_table(player, 33)
 
-        save_data.set_table(player, 33, {}, 'sub')
+        save_data.set_table(player, 33, 'sub', {})
         fake_ltimer.debug_fastward(20)
 
         assert(next(player.storage[33].sub) == nil, '空表覆盖必须清掉所有子字段')
@@ -1042,7 +1042,7 @@ local function run_tests()
         save_data.load_table(player, 36)
 
         local ok, err = pcall(function ()
-            save_data.set_field(player, 36, 1, 'a', 'b')
+            save_data.set_field(player, 36, 'a', 'b', 1)
         end)
         assert(not ok, 'auto 关闭时父表缺失必须报错')
         assert(tostring(err):find('父表不存在', 1, true), tostring(err))
@@ -1056,7 +1056,7 @@ local function run_tests()
 
         save_data.auto = true
         local ok, err = pcall(function ()
-            save_data.set_field(player, 37, 1, 'a', 'b', 'c')
+            save_data.set_field(player, 37, 'a', 'b', 'c', 1)
         end)
         save_data.auto = false
 
@@ -1075,7 +1075,7 @@ local function run_tests()
         })
         save_data.load_table(player, 38)
 
-        save_data.set_table(player, 38, { hp = 2 }, 'hero')
+        save_data.set_table(player, 38, 'hero', { hp = 2 })
         fake_ltimer.debug_fastward(20)
 
         assert(player.storage[38].hero.name == nil, '整树替换必须删掉没出现的键')
@@ -1114,11 +1114,11 @@ local function run_tests()
         local player = new_player({ [41] = { a = { b = 1 } } })
         save_data.load_table(player, 41)
 
-        save_data.set_field(player, 41, 2, 'a', 'b')
+        save_data.set_field(player, 41, 'a', 'b', 2)
         fake_ltimer.debug_fastward(10)
         assert(player.storage[41].a.b == 2)
 
-        save_data.set_field(player, 41, nil, 'a', 'b')
+        save_data.set_field(player, 41, 'a', 'b', nil)
         fake_ltimer.debug_fastward(10)
         assert(player.storage[41].a.b == nil)
     end
@@ -1138,6 +1138,27 @@ local function run_tests()
         fake_ltimer.debug_fastward(20)
         assert(player.storage[42].old == nil, '被原生死值遮住的 key 也必须删掉')
         assert(player.storage[42].keep == 2)
+    end
+
+    do
+        -- key 在前、值在最后：参数个数不对必须当场报错，不能把 key 当成值写下去。
+        local player = new_player({ [43] = { a = { b = 1 } } })
+        save_data.load_table(player, 43)
+
+        local ok1 = pcall(function () save_data.set_field(player, 43, 'a') end)
+        assert(not ok1, 'set_field 至少要给一个 key 和一个值')
+
+        local ok2 = pcall(function () save_data.set_field(player, 43, 'a', 'b', 'c', 'd', 1) end)
+        assert(not ok2, 'set_field 最多三层 key')
+
+        local ok3 = pcall(function () save_data.set_table(player, 43, 'a', 'b', 'c', {}) end)
+        assert(not ok3, 'set_table 最多两层 key')
+
+        local ok4 = pcall(function () save_data.set_table(player, 43, 'a', 1) end)
+        assert(not ok4, 'set_table 最后一个参数必须是表')
+
+        fake_ltimer.debug_fastward(20)
+        assert(player.storage[43].a.b == 1, '参数不对时不得写进任何东西')
     end
 end
 

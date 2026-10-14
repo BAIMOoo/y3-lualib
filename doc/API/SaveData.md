@@ -96,17 +96,17 @@ function SaveData.save_table(player: Player, slot: integer, t: table)
 ## set_field
 
 ```lua
-function SaveData.set_field(player: Player, slot: integer, value: any, key1: string|integer, key2: string|integer, key3: string|integer)
+function SaveData.set_field(player: Player, slot: integer, key1: string|integer, ..., value: any)
 ```
 
- 按路径写一个存档字段（与 ECA 的「写入存档字段」节点对应），值可以是标量或一张表；值填 `nil` 等于删除。路径上缺失 / 不是表的父级是否自动补建取决于 `y3.save_data.auto`。
+ 按路径写一个存档字段（与 ECA 的「写入存档字段」节点对应，但参数顺序相反：这里 key 在前、值在最后）。key 给 1~3 层，值可以是标量或一张表；值填 `nil` 等于删除。路径上缺失 / 不是表的父级是否自动补建取决于 `y3.save_data.auto`。
 ## set_table
 
 ```lua
-function SaveData.set_table(player: Player, slot: integer, t: table, key1: string|integer, key2: string|integer)
+function SaveData.set_table(player: Player, slot: integer, ..., t: table)
 ```
 
- 把一张表整体写入存档：这张表就是该子树（`key1` / `key2` 指定，缺省为槽位根）的最终内容。未出现在表里的键都会被删除；空表表示清空该子树。
+ 把一张表整体写入存档：这张表就是该子树的最终内容（key 在前、值在最后；key 给 0~2 层，不给就是槽位根）。未出现在表里的键都会被删除；空表表示清空该子树。
 ## auto
 
 ```lua
