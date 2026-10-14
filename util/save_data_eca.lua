@@ -114,22 +114,8 @@ end
 ---的视图；py 层（ECA「遍历表」→ `GameAPI:table_iterator` → `_Up1GetPairs`）是按原生
 ---pairs 遍历的，视图里的字段一条都拿不到（实测线上遍历出 0 条）。因此凡是带元表的表
 ---都先物化成普通表再交出去；本来就是普通表（无元表）的原样返回，保持原来的身份语义。
----@param value any
----@param depth? integer
----@return any
-local function to_plain_table(value, depth)
-    if type(value) ~= 'table' or getmetatable(value) == nil then
-        return value
-    end
-    if (depth or 1) > 8 then
-        return value
-    end
-    local result = {}
-    for k, v in pairs(value) do
-        result[k] = to_plain_table(v, (depth or 1) + 1)
-    end
-    return result
-end
+---（实现见 `util/save_data.lua` 的 `M.to_plain_table`：整表写入也要先解包，两处共用一份。）
+local to_plain_table = save_data.to_plain_table
 
 ---@param player Player
 ---@param slot integer
@@ -181,6 +167,20 @@ end
 local function write_field(player, slot, value, key1, key2, key3)
     normalize_keys(key1, key2, key3)
     local data = save_data.load_table(player, slot, true)
+    -- `y3.save_data.auto` 打开时，路径上缺失 / 不是表的父级也补成表（与 Lua 的 set_field
+    -- 同一套规则）。值填 nil 是删除，不参与补建：否则会为了删一个字段留下一张空的中间表。
+    if save_data.auto and value ~= nil then
+        local keys = { key1 }
+        if key2 ~= nil then
+            keys[2] = key2
+        end
+        if key3 ~= nil then
+            keys[3] = key3
+        end
+        local parent, key = save_data.resolve_write_parent(data, keys)
+        parent[key] = value
+        return
+    end
     local target, key = get_target(data, key1, key2, key3, true)
     target[key] = value
 end

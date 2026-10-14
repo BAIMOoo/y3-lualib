@@ -14,6 +14,9 @@ y3.helper = y3.helper or {
     end,
 }
 log.info = log.info or function (...) end
+-- `y3.save_data.auto` 换掉非表父级时会 warn，测试里收下来断言。
+local warnings = {}
+log.warn = function (...) warnings[#warnings + 1] = table.concat({ ... }, ' ') end
 
 local timers = {}
 local level_switch_callback
@@ -509,19 +512,19 @@ local function run_tests()
         assert(type(player.storage[13].y) == 'table')
         assert(next(player.storage[13].y) == nil, '原生 y 不得带字段')
 
-        -- 不放宽非空表限制
-        local ok1, err1 = pcall(function () data.z = { 1 } end)
-        assert(not ok1, '非空表赋值必须报错')
-        assert(tostring(err1):find('禁止覆盖模式下非空表不能作为存档的值', 1, true), tostring(err1))
+        -- 赋一张非空表 = 把这个键位所在的子树整体替换成它
+        data.z = { 1 }
+        fake_ltimer.debug_fastward(20)
+        assert(player.storage[13].z[1] == 1, '非空表赋值必须整树写进原生')
     end
 
     do
-        -- 代理包着非空表（引擎快照里的子表）仍然必须报错
+        -- 代理包着非空表（引擎快照里的子表）：赋出去 = 整树替换对方，而不是报错
         local player = new_player({
             [14] = {
                 a = {
                     b = {
-                        c = { x = 1 },
+                        c = 1,
                     },
                 },
             },
@@ -530,9 +533,9 @@ local function run_tests()
 
         assert(type(data.a.b) == 'table')
 
-        local ok2, err2 = pcall(function () data.m = data.a.b end)
-        assert(not ok2, '代理包着非空表必须报错')
-        assert(tostring(err2):find('禁止覆盖模式下非空表不能作为存档的值', 1, true), tostring(err2))
+        data.m = data.a.b
+        fake_ltimer.debug_fastward(20)
+        assert(player.storage[14].m.c == 1, '代理包着的非空表必须整树写出去')
     end
 
     do
@@ -951,6 +954,190 @@ local function run_tests()
         assert(find_call(player.calls, 'set', '', '', '', 1) == nil, '空 key 不得下发到原生')
         assert(find_call(player.calls, 'set', 'a', '', '', 1) == nil, '空 key 不得下发到原生')
         assert(find_call(player.calls, 'set', 'a', 'b', '', 1) == nil, '空 key 不得下发到原生')
+    end
+
+    do
+        -- set_table：根上整树替换。没出现在表里的键（任意层）必须删掉；值没变的字段不得重写。
+        local player = new_player({
+            [32] = {
+                keep = 1,
+                change = 1,
+                drop = { deep = true },
+                sub = { a = 1, b = 2 },
+            },
+        })
+        save_data.load_table(player, 32)
+
+        save_data.set_table(player, 32, {
+            keep = 1,
+            change = 2,
+            sub = { a = 1, c = 3 },
+        })
+        fake_ltimer.debug_fastward(20)
+
+        local storage = player.storage[32]
+        assert(storage.keep == 1)
+        assert(storage.change == 2)
+        assert(storage.drop == nil, '没出现在表里的键必须删掉')
+        assert(storage.sub.b == nil, '子表里没出现的键也要删掉')
+        assert(storage.sub.c == 3, '子表里新增的键必须写上')
+        assert(count_calls(player.calls, 'set', 'keep', '', '', 1) == 0, '值没变的字段不得重写')
+        assert(count_calls(player.calls, 'set', 'sub', 'a', '', 1) == 0, '子表里值没变的字段不得重写')
+        assert(count_calls(player.calls, 'remove', 'drop', '') == 1, '多出来的键必须删除')
+    end
+
+    do
+        -- set_table 子树路径 + 目标为空：写一张空表覆盖（1 次），不逐键删除。
+        local player = new_player({
+            [33] = {
+                sub = { a = 1, b = 2, c = 3 },
+            },
+        })
+        save_data.load_table(player, 33)
+
+        save_data.set_table(player, 33, {}, 'sub')
+        fake_ltimer.debug_fastward(20)
+
+        assert(next(player.storage[33].sub) == nil, '空表覆盖必须清掉所有子字段')
+        assert(count_calls(player.calls, 'remove') == 0, '清空子树不得逐键删除')
+        assert(count_calls(player.calls, 'set', 'sub', '', '') == 1)
+    end
+
+    do
+        -- 根上 set_table({})：原生没有「整表写到根」的操作，只能逐键删除。
+        local player = new_player({ [34] = { a = 1, b = 2 } })
+        save_data.load_table(player, 34)
+
+        save_data.set_table(player, 34, {})
+        fake_ltimer.debug_fastward(20)
+
+        assert(next(player.storage[34]) == nil, '根上的空表必须清空整个槽位')
+        assert(count_calls(player.calls, 'remove') == 2)
+    end
+
+    do
+        -- 校验不通过时整体报错：一个字段都不写。
+        local player = new_player()
+        save_data.load_table(player, 35)
+
+        local ok, err = pcall(function ()
+            save_data.set_table(player, 35, { a = 1, bad = { x = { y = { z = 1 } } } })
+        end)
+        assert(not ok, '超过 3 层必须报错')
+        assert(tostring(err):find('最多只支持', 1, true), tostring(err))
+
+        local ok_key = pcall(function ()
+            save_data.set_table(player, 35, { a = 1, [2] = { [''] = 1 } })
+        end)
+        assert(not ok_key, '表里的空字符串 key 必须报错')
+
+        fake_ltimer.debug_fastward(20)
+        assert(count_calls(player.calls, 'set') == 0, '校验失败不得写进任何一个字段')
+        assert(player.storage[35].a == nil)
+    end
+
+    do
+        -- set_field：auto 关闭时父表缺失直接报错（与点写一致），不写任何东西。
+        local player = new_player()
+        save_data.load_table(player, 36)
+
+        local ok, err = pcall(function ()
+            save_data.set_field(player, 36, 1, 'a', 'b')
+        end)
+        assert(not ok, 'auto 关闭时父表缺失必须报错')
+        assert(tostring(err):find('父表不存在', 1, true), tostring(err))
+        assert(count_calls(player.calls, 'set') == 0)
+    end
+
+    do
+        -- set_field + auto：缺的层建出来、不是表的层换成表（并 warn），值最终一定落地。
+        local player = new_player({ [37] = { a = 5 } })
+        save_data.load_table(player, 37)
+
+        save_data.auto = true
+        local ok, err = pcall(function ()
+            save_data.set_field(player, 37, 1, 'a', 'b', 'c')
+        end)
+        save_data.auto = false
+
+        assert(ok, 'auto 打开时深路径写入必须成功，实际：' .. tostring(err))
+        fake_ltimer.debug_fastward(20)
+        assert(type(player.storage[37].a) == 'table', '不是表的父级必须换成表')
+        assert(player.storage[37].a.b.c == 1)
+        assert(warnings[#warnings] and warnings[#warnings]:find('auto', 1, true),
+            '换掉非表父级必须记一条 warn')
+    end
+
+    do
+        -- set_table 到子树路径：父表已存在时整树替换该子树。
+        local player = new_player({
+            [38] = { hero = { name = 'a', hp = 1 } },
+        })
+        save_data.load_table(player, 38)
+
+        save_data.set_table(player, 38, { hp = 2 }, 'hero')
+        fake_ltimer.debug_fastward(20)
+
+        assert(player.storage[38].hero.name == nil, '整树替换必须删掉没出现的键')
+        assert(player.storage[38].hero.hp == 2)
+    end
+
+    do
+        -- 目标路径当前是标量：整表赋值把它覆盖成表（替换语义的必然结果）。
+        local player = new_player({ [39] = { a = 5 } })
+        local data = save_data.load_table(player, 39)
+
+        data.a = { b = 1 }
+        fake_ltimer.debug_fastward(20)
+
+        assert(type(player.storage[39].a) == 'table')
+        assert(player.storage[39].a.b == 1)
+    end
+
+    do
+        -- 替换后重新索引必须读到新内容，不能被代理缓存里的旧子表挡住。
+        local player = new_player({
+            [40] = { hero = { name = 'old', hp = 1 } },
+        })
+        local data = save_data.load_table(player, 40)
+
+        assert(data.hero.name == 'old')
+        data.hero = { name = 'new' }
+        fake_ltimer.debug_fastward(20)
+
+        assert(data.hero.name == 'new', '替换后重新索引必须读到新内容')
+        assert(data.hero.hp == nil, '被替换掉的字段不得残留')
+    end
+
+    do
+        -- set_field 写标量 / 写 nil 删除。
+        local player = new_player({ [41] = { a = { b = 1 } } })
+        save_data.load_table(player, 41)
+
+        save_data.set_field(player, 41, 2, 'a', 'b')
+        fake_ltimer.debug_fastward(10)
+        assert(player.storage[41].a.b == 2)
+
+        save_data.set_field(player, 41, nil, 'a', 'b')
+        fake_ltimer.debug_fastward(10)
+        assert(player.storage[41].a.b == nil)
+    end
+
+    do
+        -- 早于本会话的 key 不在快照里、但原生有值：整表替换也要能把它删掉。
+        local player = new_player({
+            [42] = { old = 1, keep = 2 },
+        })
+        local data = save_data.load_table(player, 42)
+
+        -- 第三方绕过代理把 old 改掉，代理以原生为准。
+        player.handle:set_save_table_key_value(42, 'old', 9, '', '', '')
+        assert(data.old == 9)
+
+        save_data.set_table(player, 42, { keep = 2 })
+        fake_ltimer.debug_fastward(20)
+        assert(player.storage[42].old == nil, '被原生死值遮住的 key 也必须删掉')
+        assert(player.storage[42].keep == 2)
     end
 end
 

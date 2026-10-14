@@ -305,6 +305,16 @@ function M:upload_save_data()
     self.handle:upload_save_data()
 end
 
+---把一张表整体写入玩家存档：这张表就是该子树的最终内容（`key1` / `key2` 是路径，缺省为槽位根）。
+---未出现在表里的键（任意层）都会被删除，空表表示清空该子树。详见 `y3.save_data.set_table`。
+---@param slot integer 存档槽位
+---@param t table 该子树的最终内容
+---@param key1? string|integer
+---@param key2? string|integer
+function M:set_save_table(slot, t, key1, key2)
+    return y3.save_data.set_table(self, slot, t, key1, key2)
+end
+
 ---增加全局存档
 ---@param key string 键
 ---@param value integer 值

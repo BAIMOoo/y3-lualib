@@ -47,6 +47,7 @@ if not y3.helper then
         tonumber = function(value) return value end,
     }
 end
+log.warn = log.warn or function (...) end
 
 local real_eca = y3.eca
 local real_loaded_save_data_eca = package.loaded['y3.util.save_data_eca']
@@ -163,6 +164,11 @@ local function new_player()
             return slot_data(slot)
         end,
         set_save_table_key_value = function(_, slot, key1, value, key2, key3)
+            -- 与真引擎一致：禁止覆盖模式的原生接口只接受「先建空表、再逐字段写入」，
+            -- 非空表直接被拒。不校验的话，「把非空表整个下发原生」的错误实现会通过测试。
+            if type(value) == 'table' and next(value) ~= nil then
+                error('native table creation must receive an empty table')
+            end
             set_value(slot, key1, value, key2, key3)
         end,
         get_save_table_key_value = function(_, slot, key1, key2, key3)
@@ -435,6 +441,66 @@ local function run_tests()
         player.storage[109].s = 5
         assert(Bind['读取存档字段'](player, 109, 's') == 5)
         assert(Bind['读取存档字段'](player, 109, 'none') == nil)
+    end
+
+    do
+        -- 值填一张非空表 = 把这个键位所在的子树整体替换成它（与 Lua 的整表赋值同义）。
+        -- 原生只接受「先建空表、再逐字段写入」，绝不能把这张表整个下发原生。
+        local player = new_player()
+        player.storage[110] = { hero = { name = 'old', hp = 1 }, other = 1 }
+
+        Bind['写入存档字段'](player, 110, { hp = 2 }, 'hero')
+        drain_pending_writes(player, 110)
+
+        assert(player.storage[110].hero.name == nil, '没出现在表里的键必须删掉')
+        assert(player.storage[110].hero.hp == 2)
+        assert(player.storage[110].other == 1, '其它字段不得受影响')
+        assert(Bind['读取存档字段'](player, 110, 'hero', 'hp') == 2)
+
+        -- 值是一张空表时仍是「把这个键位写成一个空表」。
+        Bind['写入存档字段'](player, 110, {}, 'empty_box')
+        drain_pending_writes(player, 110)
+        assert(type(player.storage[110].empty_box) == 'table')
+        assert(next(player.storage[110].empty_box) == nil)
+    end
+
+    do
+        -- auto 关闭（默认）：深路径父表缺失仍然报错，且不留表。
+        local player = new_player()
+        local previous = capture_errors()
+        Bind['写入存档字段'](player, 111, 1, 'a', 'b')
+        local errors = captured_errors
+        log.error = previous
+        drain_pending_writes(player, 111)
+        assert(#errors == 1 and errors[1]:find('父表不存在', 1, true),
+            'auto 关闭时父表缺失必须报错，实际：' .. tostring(errors[1]))
+        assert(player.storage[111].a == nil, 'auto 关闭时不得补建父表')
+    end
+
+    do
+        -- auto 打开：缺的层建出来、不是表的层换成表（并 warn），值最终落地。
+        local save_data = require 'y3.util.save_data'
+        local player = new_player()
+        player.storage[112] = { a = 5 }
+
+        local warnings = {}
+        local previous_warn = log.warn
+        log.warn = function (...) warnings[#warnings + 1] = table.concat({ ... }, ' ') end
+
+        save_data.auto = true
+        local ok, err = pcall(function ()
+            Bind['写入存档字段'](player, 112, 1, 'a', 'b', 'c')
+        end)
+        save_data.auto = false
+        log.warn = previous_warn
+
+        assert(ok, 'auto 打开时深路径写入必须成功，实际：' .. tostring(err))
+        drain_pending_writes(player, 112)
+        assert(type(player.storage[112].a) == 'table', '不是表的父级必须换成表')
+        assert(player.storage[112].a.b.c == 1)
+        assert(Bind['读取存档字段'](player, 112, 'a', 'b', 'c') == 1)
+        assert(warnings[#warnings] and warnings[#warnings]:find('auto', 1, true),
+            '换掉非表父级必须记一条 warn')
     end
 end
 

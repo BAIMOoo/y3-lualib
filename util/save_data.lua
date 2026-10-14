@@ -20,6 +20,13 @@ local M = {}
 -- * 删除不做延期（父级缺失 / 不是表时按 errcode 4 报错，与写入的「延期」不同）；但父级只是
 --   还没落盘（本会话刚建 / 还在暂存队列里）时，会先把该槽位的暂存写入排空再下发删除，
 --   否则刚建好的父表会被误判成「父表不存在」。
+-- * 字段赋一张「非空表」= 把该键位所在的子树整体替换成这张表：未出现在表里的键（任意层）
+--   都会删除；空表则只是把该键位写成一个空表（`data.a = {}` 会清掉 a 下面的所有字段）。
+--   替换按「值没变就不写」做 diff，不会为了改一个字段而重写整棵子树。
+-- * `M.auto`（默认 false）只对「路径当参数传」的写入生效：`M.set_field`、
+--   `M.set_table` 的路径前缀、ECA 的「写入存档字段」节点。Lua 的点写 `data.a.b = x`
+--   在 a 缺失 / 不是表时由 Lua 语法本身拦下（attempt to index a nil value），代理接不到，
+--   因此不受本开关影响；删除（赋 nil）同样不受它影响。
 ---@private
 M.table_cache = setmetatable({}, { __mode = 'k' })
 
@@ -143,6 +150,155 @@ end
 ---@param value string
 function M.save_string(player, slot, value)
     player.handle:set_save_data_str_value(slot, value)
+end
+
+---路径当参数传的写入（`set_field` / `set_table` 的路径前缀 / ECA 的写入节点）
+---在父级缺失 / 不是表时，是否自动按序补成表。
+---
+---默认 `false`，即保持旧行为：父级缺失 / 不是表时直接报错。
+---置为 `true` 后，写入路径上缺的层会被建出来、不是表的层会被换成表，保证这次写入落地；
+---换掉一个已存在的非表值时会打一条 `log.warn` 记录被丢弃的旧值。
+---
+---只对「路径当参数传」的写入生效：`y3.save_data.set_field`、`y3.save_data.set_table` 的路径前缀，
+---以及 ECA 的「写入存档字段」节点。Lua 的点写 `data.a.b = x` 在 `a` 缺失 / 不是表时由 Lua
+---语法本身拦下（attempt to index a nil value），代理接不到，因此不受本开关影响；
+---删除（赋 `nil`）也不受影响，仍按旧行为报错。
+---@type boolean
+M.auto = false
+
+---@private
+---键路径文本，只用于报错：`a` / `a.b`；`upto` 限定只用前几层。
+---@param keys (string|integer)[]
+---@param upto? integer
+---@return string
+local function keys_text(keys, upto)
+    local n = upto or #keys
+    if n <= 0 then
+        return '<存档根>'
+    end
+    local parts = {}
+    for i = 1, n do
+        parts[i] = tostring(keys[i])
+    end
+    return table.concat(parts, '.')
+end
+
+---@private
+---@param path table|nil
+---@param key any
+---@return table
+local function append_path(path, key)
+    local new_path = path and { table.unpack(path) } or {}
+    new_path[#new_path + 1] = key
+    return new_path
+end
+
+---@private
+---把带元表的「视图表」物化成普通 Lua 表，并解开代理。
+---平台（在线）构建里引擎交回来的实时存档表是「字段藏在 __pairs 后面、raw 键为空」的视图：
+---直接 `next` 会当成空表、py 层按原生 pairs 也拿不到字段，因此凡是要遍历的表都先过一遍这里。
+---本来就是普通表（无元表）的原样返回，保持原来的身份语义。
+---@param value any
+---@param depth? integer
+---@return any
+function M.to_plain_table(value, depth)
+    if type(value) ~= 'table' or getmetatable(value) == nil then
+        return value
+    end
+    if (depth or 1) > 8 then
+        return value
+    end
+    local result = {}
+    for k, v in pairs(value) do
+        result[k] = M.to_plain_table(v, (depth or 1) + 1)
+    end
+    return result
+end
+
+---@private
+---@param key any
+local function check_key(key)
+    if type(key) ~= 'string' and math.type(key) ~= 'integer' then
+        error('存档的key必须是字符串或者整数')
+    end
+    -- 引擎用空字符串表示「这一层没有 key」，放行空字符串会让第 2/3 层的空 key 退化成写父级。
+    if key == '' then
+        error('存档的key不能是空字符串')
+    end
+end
+
+---@private
+---整表写入前的全量校验：任何一处非法都在写之前抛出，保证不会只写进去一半。
+---@param value any
+---@param depth integer 当前层数（顶层传 1）
+---@param max_depth integer 该路径允许的最大层数
+---@param text string 出错时用来定位的路径文本
+local function validate_save_table(value, depth, max_depth, text)
+    if type(value) ~= 'table' then
+        error(('存档的值只能是基础类型：%s'):format(text))
+    end
+    if depth > max_depth then
+        error(('存档表最多只支持3层嵌套：%s'):format(text))
+    end
+    for k, v in pairs(value) do
+        if type(k) ~= 'string' and math.type(k) ~= 'integer' then
+            error(('存档的key必须是字符串或者整数：%s'):format(text))
+        end
+        if k == '' then
+            error(('存档的key不能是空字符串：%s'):format(text))
+        end
+        local child_text = ('%s.%s'):format(text, tostring(k))
+        local vtype = type(v)
+        if vtype == 'table' then
+            validate_save_table(v, depth + 1, max_depth, child_text)
+        elseif vtype ~= 'string' and vtype ~= 'boolean' and vtype ~= 'number' then
+            error(('存档的值只能是基础类型：%s'):format(child_text))
+        end
+    end
+end
+
+---@private
+---沿代理路径取「点写的父表」，返回的 `key` 就是目标字段名。
+---`create`（即 `M.auto`）为 true 时，路径上缺失 / 不是表的层会补成表（换掉非表值时打日志）；
+---为 false 时父级缺失 / 不是表返回 nil 与报错文案，由调用方决定是报错还是 no-op。
+---@param data table 该槽位的顶层代理表
+---@param keys (string|integer)[] 1~3 层 key
+---@param create boolean
+---@return table? parent
+---@return string|integer? key
+---@return string? err
+local function resolve_write_parent(data, keys, create)
+    local node = data
+    for i = 1, #keys - 1 do
+        local name = keys[i]
+        local child = node[name]
+        if type(child) ~= 'table' then
+            local text = keys_text(keys, i)
+            if not create then
+                if child == nil then
+                    return nil, nil, ('存档路径的父表不存在：%s'):format(text)
+                end
+                return nil, nil, ('存档路径的父字段不是表：%s'):format(text)
+            end
+            if child ~= nil then
+                log.warn(('存档路径的父字段不是表，已按 y3.save_data.auto 换成表：%s'):format(text))
+            end
+            node[name] = {}
+            child = node[name]
+        end
+        node = child
+    end
+    return node, keys[#keys]
+end
+
+---按 `M.auto` 的规则解析点写目标：返回父表与最后一层 key。
+---@param data table 该槽位的顶层代理表
+---@param keys (string|integer)[] 1~3 层 key
+---@return table? parent
+---@return string|integer? key
+---@return string? err
+function M.resolve_write_parent(data, keys)
+    return resolve_write_parent(data, keys, M.auto)
 end
 
 ---@type table<Player, table<integer, [table, boolean]>>
@@ -529,6 +685,22 @@ function M.load_table_with_cover_disable(player, slot)
         return type(read_native_value(key1, key2, '')) == 'table'
     end
 
+    --某个具体路径当前是不是一张表（整表替换时判断「要不要先建 / 换一张表」）。
+    --与 is_table_level 的区别：这里用的是完整的 key1/key2/key3，第 3 层也能问。
+    ---@param key1 any
+    ---@param key2 any
+    ---@param key3 any
+    ---@return boolean
+    local function current_is_table(key1, key2, key3)
+        if is_pending_table(key1, key2, key3) or is_created_in_this_stage(key1, key2, key3) then
+            return true
+        end
+        if is_deleted(key1, key2, key3) then
+            return false
+        end
+        return type(read_native_value(key1, key2, key3)) == 'table'
+    end
+
     ---与 ECA 的路径语义对齐：写嵌套字段前，父级必须是表。
     ---父级在原生已是表、或本会话刚建 / 暂存队列里即将建成表时放行；父级缺失或不是表时
     ---直接报错（引擎自己也会拒绝这种写入并返回 errcode 4，这里提前拦是为了当场抛出并给出
@@ -685,7 +857,41 @@ function M.load_table_with_cover_disable(player, slot)
         return false
     end
 
-    local function set_value(key, value, path)
+    local set_value
+
+    --`M.auto` 打开时，把写入路径上缺失 / 不是表的层补成表，保证这次写入落地。
+    --关闭时什么都不做，交给下面的 `check_parent_table` 按旧行为报错。
+    --只有「路径当参数传」的写入才可能走到需要补建的场景：Lua 的点写 `data.a.b = x` 在 a
+    --缺失 / 不是表时由 Lua 语法本身拦下，代理根本接不到。
+    ---@param key1 any
+    ---@param key2 any
+    ---@param key3 any
+    local function ensure_auto_parents(key1, key2, key3)
+        if not M.auto then
+            return
+        end
+        if key2 ~= nil and key2 ~= '' then
+            if not is_table_level(key1, '') or is_deleted(key1, '', '') then
+                local old = read_native_value(key1, '', '')
+                if old ~= nil and type(old) ~= 'table' then
+                    log.warn(('存档路径的父字段不是表，已按 y3.save_data.auto 换成表：%s'):format(tostring(key1)))
+                end
+                set_value(key1, {}, {})
+            end
+        end
+        if key3 ~= nil and key3 ~= '' then
+            if not is_table_level(key1, key2) or is_deleted(key1, key2, '') then
+                local old = read_native_value(key1, key2, '')
+                if old ~= nil and type(old) ~= 'table' then
+                    log.warn(('存档路径的父字段不是表，已按 y3.save_data.auto 换成表：%s')
+                        :format(keys_text({ key1, key2 })))
+                end
+                set_value(key2, {}, { key1 })
+            end
+        end
+    end
+
+    set_value = function(key, value, path)
         local key1, key2, key3 = unpack_path(key, path)
         if value == nil then
             remove_pending_writes(key1, key2, key3)
@@ -711,6 +917,7 @@ function M.load_table_with_cover_disable(player, slot)
         -- 轮次落盘，那时顺序已经不等于赋值顺序，甚至可能写进一个已经变成标量的
         -- 父表，所以必须一并撤销（删除分支同样会撤销这些暂存写入）。
         -- 校验放在改标记之前：父级不合法时直接抛错，不留下任何状态。
+        ensure_auto_parents(key1, key2, key3)
         check_parent_table(key1, key2, key3)
         remove_pending_writes(key1, key2, key3)
         unmark_deleted(key1, key2, key3)
@@ -774,14 +981,55 @@ function M.load_table_with_cover_disable(player, slot)
             value = y3.helper.as_lua(value)
             local vtype = type(value)
             if vtype == 'table' then
-                -- 代理自带 [CONFIG]/[CUSTOM] 哨兵键，`next(代理)` 恒非 nil；
-                -- 必须先解包成原生表再判空，否则空表的代理会被误判成非空表。
-                -- 非代理表 `raw` 返回自身，因此普通表的校验语义不变。
-                value = y3.proxy.raw(value)
-                if next(value) ~= nil then
-                    error('禁止覆盖模式下非空表不能作为存档的值')
+                -- 非空表 = 把这个键位所在的子树整体替换成它（空表只是把这个键位写成空表）。
+                -- 必须先物化：代理自带 [CONFIG]/[CUSTOM] 哨兵键、平台构建的视图表字段藏在
+                -- __pairs 后面，不解包就会把一张有内容的表误判成空表。
+                local target = M.to_plain_table(value)
+                if next(target) == nil then
+                    set_value(key, {}, path)
+                    -- 快照里保留调用方给的那张表本身（普通表 `to_plain_table` 原样返回），
+                    -- 与旧行为一致：之后直接改这张表，代理是看不到的。
+                    raw[key] = target
+                    return
                 end
-            elseif vtype ~= 'nil'
+                local key1, key2, key3 = unpack_path(key, path)
+                local node_path = append_path(path, key)
+                if #node_path >= 3 then
+                    -- 第 3 层再放一张有内容的表就要用到第 4 层了。
+                    error(('存档表最多只支持3层嵌套：%s'):format(keys_text(node_path)))
+                end
+                -- 先整张校验再写：任何一处非法都在写之前抛出，不会只写进去一半。
+                validate_save_table(target, 1, 3 - #node_path, keys_text(node_path))
+                local node_raw = raw[key]
+                if current_is_table(key1, key2, key3) then
+                    if type(node_raw) ~= 'table' then
+                        node_raw = read_native_value(key1, key2, key3)
+                        if type(node_raw) ~= 'table' then
+                            node_raw = {}
+                        end
+                    end
+                else
+                    -- 不存在 / 不是表 / 已被删除：先写一张空表把它建出来（1 次原生写入）。
+                    set_value(key, {}, path)
+                    node_raw = {}
+                end
+                -- 整表替换：多出来的键删掉，目标表里的键按代理写入（嵌套表会递归走回这里）。
+                raw[key] = node_raw
+                local node = create_proxy(node_raw, node_path)
+                for k in pairs(node) do
+                    if target[k] == nil then
+                        node[k] = nil
+                    end
+                end
+                for k, v in pairs(target) do
+                    -- 值没变就不写：表交给代理递归做 diff，标量直接比一次。
+                    if type(v) == 'table' or node[k] ~= v then
+                        node[k] = v
+                    end
+                end
+                return
+            end
+            if vtype ~= 'nil'
             and    vtype ~= 'string'
             and    vtype ~= 'boolean'
             and    vtype ~= 'number' then
@@ -846,6 +1094,90 @@ function M.load_table_with_cover_disable(player, slot)
     local proxy_save_data = create_proxy(save_data)
 
     return proxy_save_data
+end
+
+---把一张表整体写入存档：这张表就是该子树（`key1` / `key2` 指定，都缺省时为槽位根）的最终内容。
+---
+---未出现在表里的键（任意层）都会被删除；空表表示该键位变成一个空表（在根上就是清空整个槽位）。
+---传入表最多 `3 - 路径层数` 层，超出报错；键与值的规则和表存档一致。
+---写入前会先把整张表校验一遍，任何一处非法都整体报错、一个字段都不写。
+---与现值相同的字段不会产生原生写入。
+---
+---等价写法：`y3.save_data.load_table(player, slot)[key1][key2] = t`。
+---（注意 `key1` / `key2` 是**路径**，缺失的层是否自动补建取决于 `y3.save_data.auto`。）
+---@param player Player
+---@param slot integer
+---@param t table 该子树的最终内容
+---@param key1? string|integer
+---@param key2? string|integer
+function M.set_table(player, slot, t, key1, key2)
+    if type(t) ~= 'table' then
+        error('存档的值只能是基础类型')
+    end
+    local data = M.load_table(player, slot)
+    local target = M.to_plain_table(t)
+    if key1 == nil then
+        validate_save_table(target, 1, 3, '<存档根>')
+        -- 根上只能逐键增删：原生没有「把整张表写到根」的操作（key1/key2/key3 是位置式的 key，
+        -- 根表本身没有 key）。所以根清空就是逐个删除顶层字段。
+        for k in pairs(data) do
+            if target[k] == nil then
+                data[k] = nil
+            end
+        end
+        for k, v in pairs(target) do
+            -- 值没变就不写：表交给代理递归做 diff，标量直接比一次。
+            if type(v) == 'table' or data[k] ~= v then
+                data[k] = v
+            end
+        end
+        return
+    end
+    local keys = { key1 }
+    check_key(key1)
+    if key2 ~= nil then
+        check_key(key2)
+        keys[2] = key2
+    end
+    local parent, key, err = M.resolve_write_parent(data, keys)
+    if not parent then
+        error(err)
+    end
+    parent[key] = target
+end
+
+---按路径写一个字段（与 ECA 的「写入存档字段」节点对应），值可以是标量或一张表。
+---值是表时等价于 `y3.save_data.set_table(player, slot, value, key1, key2)`；值填 `nil` 等于删除。
+---路径上缺失 / 不是表的父级是否自动补建，取决于 `y3.save_data.auto`。
+---@param player Player
+---@param slot integer
+---@param value any
+---@param key1 string|integer
+---@param key2? string|integer
+---@param key3? string|integer
+function M.set_field(player, slot, value, key1, key2, key3)
+    if key1 == nil then
+        error('存档的第一个key不能为空')
+    end
+    if key2 == nil and key3 ~= nil then
+        error('存档路径不能跳过第二层key')
+    end
+    local keys = { key1 }
+    check_key(key1)
+    if key2 ~= nil then
+        check_key(key2)
+        keys[2] = key2
+        if key3 ~= nil then
+            check_key(key3)
+            keys[3] = key3
+        end
+    end
+    local data = M.load_table(player, slot)
+    local parent, key, err = M.resolve_write_parent(data, keys)
+    if not parent then
+        error(err)
+    end
+    parent[key] = value
 end
 
 return M
