@@ -93,6 +93,27 @@ function SaveData.save_table(player: Player, slot: integer, t: table)
 ```
 
  保存玩家的存档数据（表），存档设置中必须使用允许覆盖模式
+## set_field
+
+```lua
+function SaveData.set_field(player: Player, slot: integer, value: any, key1: string|integer, key2: string|integer, key3: string|integer)
+```
+
+ 按路径写一个存档字段（与 ECA 的「写入存档字段」节点对应），值可以是标量或一张表；值填 `nil` 等于删除。路径上缺失 / 不是表的父级是否自动补建取决于 `y3.save_data.auto`。
+## set_table
+
+```lua
+function SaveData.set_table(player: Player, slot: integer, t: table, key1: string|integer, key2: string|integer)
+```
+
+ 把一张表整体写入存档：这张表就是该子树（`key1` / `key2` 指定，缺省为槽位根）的最终内容。未出现在表里的键都会被删除；空表表示清空该子树。
+## auto
+
+```lua
+auto: boolean
+```
+
+ 路径当参数传的写入（`set_field` / `set_table` 的路径前缀 / ECA 写入节点）在父级缺失或不是表时，是否自动补成表。默认 `false`；打开后换掉已存在的非表值会打一条 `log.warn`。不影响 Lua 的点写 `data.a.b = x`。
 ## table_cache
 
 ```lua
