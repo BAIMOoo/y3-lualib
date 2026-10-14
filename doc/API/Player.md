@@ -1050,6 +1050,20 @@ TODO:operation在lua层的表示方式待整理 方法名英文待确认
 设置暗角呼吸周期
 
 @*param* `circle_time` — 呼吸周期
+## set_save_field
+
+```lua
+(method) Player:set_save_field(slot: integer, value: any, key1: string|integer, key2: string|integer, key3: string|integer)
+```
+
+按路径写一个存档字段，值可以是标量或一张表（值填 `nil` 等于删除）；路径上缺失 / 不是表的父级是否自动补建取决于 `y3.save_data.auto`
+## set_save_table
+
+```lua
+(method) Player:set_save_table(slot: integer, t: table, key1: string|integer, key2: string|integer)
+```
+
+把一张表整体写入玩家存档：这张表就是该子树（`key1` / `key2` 指定，缺省为槽位根）的最终内容，未出现在表里的键都会被删除
 ## set_strict_group_navigation
 
 ```lua

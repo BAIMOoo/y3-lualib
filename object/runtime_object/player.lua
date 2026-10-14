@@ -315,6 +315,17 @@ function M:set_save_table(slot, t, key1, key2)
     return y3.save_data.set_table(self, slot, t, key1, key2)
 end
 
+---按路径写一个存档字段，值可以是标量或一张表（值填 `nil` 等于删除）。
+---路径上缺失 / 不是表的父级是否自动补建取决于 `y3.save_data.auto`。详见 `y3.save_data.set_field`。
+---@param slot integer 存档槽位
+---@param value any
+---@param key1 string|integer
+---@param key2? string|integer
+---@param key3? string|integer
+function M:set_save_field(slot, value, key1, key2, key3)
+    return y3.save_data.set_field(self, slot, value, key1, key2, key3)
+end
+
 ---增加全局存档
 ---@param key string 键
 ---@param value integer 值
